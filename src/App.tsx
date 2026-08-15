@@ -1,9 +1,8 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Navbar } from './components/Navbar';
 import { AuthView } from './components/AuthView';
 import { PersonalDashboard } from './components/PersonalDashboard';
 import { ActiveSessionView } from './components/ActiveSessionView';
-import { FocusCalibrationPanel } from './components/FocusCalibrationPanel';
 import { AnalyticsDashboard } from './components/AnalyticsDashboard';
 import { SessionHistoryView } from './components/SessionHistoryView';
 import { SettingsModal } from './components/SettingsModal';
@@ -13,30 +12,61 @@ import {
   StudySession, TrackerMetrics, User 
 } from './types';
 import { 
-  getCurrentUser, logoutUser,
-  getStoredSettings, saveStoredSettings, 
-  getStoredCalibration, saveStoredCalibration, 
-  getStoredStudentProfiles, saveStoredStudentProfiles,
-  getStoredActiveStudentId, saveStoredActiveStudentId,
-  getStoredSessions, saveStoredSessions, addStudySession, deleteStudySession, 
-  clearAllUserSessions
-} from './utils/storage';
+  getFirestoreUserProfile,
+  getFirestoreStudentProfiles,
+  saveFirestoreStudentProfile,
+  deleteFirestoreStudentProfile,
+  getFirestoreSettings,
+  saveFirestoreSettings,
+  getFirestoreCalibration,
+  saveFirestoreCalibration,
+  getFirestoreStudySessions,
+  saveFirestoreStudySession,
+  deleteFirestoreStudySession,
+  clearAllFirestoreStudySessions
+} from './utils/firestore';
+import { auth } from './lib/firebase';
+import { onAuthStateChanged, signOut, reload, User as FirebaseUser } from 'firebase/auth';
 import { playDistractionAlertSound, playFocusRestoredSound, playSessionCompleteSound } from './utils/audio';
-import { AlertCircle, AlertTriangle, ShieldCheck } from 'lucide-react';
+import { AlertTriangle, Loader2 } from 'lucide-react';
+
+const DEFAULT_SETTINGS: AppSettings = {
+  distractionThreshold: 5,
+  notificationCooldown: 60,
+  sensitivity: 'medium',
+  cameraPreview: true,
+  wireframeOverlay: true,
+  audioAlerts: true,
+  browserNotifications: false,
+  dailyGoalMinutes: 120,
+  simulationMode: false,
+};
+
+const DEFAULT_CALIBRATION: CalibrationData = {
+  baselineYaw: 0,
+  baselinePitch: 0,
+  baselineRoll: 0,
+  baselineGazeX: 0,
+  baselineGazeY: 0,
+  baselineFaceScale: 1.0,
+  isCalibrated: false,
+};
 
 export default function App() {
-  // Current Authenticated User State
-  const [currentUser, setCurrentUser] = useState<User | null>(() => getCurrentUser());
-  
+  // Authentication & Verification State
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [unverifiedFirebaseUser, setUnverifiedFirebaseUser] = useState<FirebaseUser | null>(null);
+
   // Primary Navigation Tabs
   const [activeTab, setActiveTab] = useState<'dashboard' | 'session' | 'analytics' | 'history' | 'settings'>('dashboard');
   
-  // User-Scoped Stored Data State
-  const [settings, setSettings] = useState<AppSettings>(() => getStoredSettings(currentUser?.id));
-  const [calibration, setCalibration] = useState<CalibrationData>(() => getStoredCalibration(currentUser?.id));
-  const [studentProfiles, setStudentProfiles] = useState<StudentProfile[]>(() => getStoredStudentProfiles(currentUser?.id));
-  const [activeStudentId, setActiveStudentId] = useState<string>(() => getStoredActiveStudentId(currentUser?.id));
-  const [sessions, setSessions] = useState<StudySession[]>(() => getStoredSessions(currentUser?.id));
+  // User-Scoped Stored Data State (Firestore Source of Truth)
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [calibration, setCalibration] = useState<CalibrationData>(DEFAULT_CALIBRATION);
+  const [studentProfiles, setStudentProfiles] = useState<StudentProfile[]>([]);
+  const [activeStudentId, setActiveStudentId] = useState<string>('');
+  const [sessions, setSessions] = useState<StudySession[]>([]);
 
   // Live session status & modals
   const [focusState, setFocusState] = useState<FocusState>('IDLE');
@@ -47,19 +77,131 @@ export default function App() {
   // Logout protection modal state
   const [showLogoutProtectionModal, setShowLogoutProtectionModal] = useState<boolean>(false);
 
-  // Sync state whenever the current user changes (Login / Logout / Switch User)
+  // 1. Firebase Auth State Listener & Reload Verification
   useEffect(() => {
-    if (currentUser) {
-      setSettings(getStoredSettings(currentUser.id));
-      setCalibration(getStoredCalibration(currentUser.id));
-      setStudentProfiles(getStoredStudentProfiles(currentUser.id));
-      setActiveStudentId(getStoredActiveStudentId(currentUser.id));
-      setSessions(getStoredSessions(currentUser.id));
-      setActiveTab('dashboard');
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      setAuthLoading(true);
+      if (fbUser) {
+        try {
+          // Force reload user to get fresh emailVerified status from Firebase backend
+          await reload(fbUser);
+          
+          if (!fbUser.emailVerified) {
+            // Block dashboard access for unverified users
+            setUnverifiedFirebaseUser(fbUser);
+            setCurrentUser(null);
+            setAuthLoading(false);
+            return;
+          }
+
+          // User is authenticated & verified!
+          setUnverifiedFirebaseUser(null);
+          
+          // Load Firestore Profile
+          let profile = await getFirestoreUserProfile(fbUser.uid);
+          if (!profile) {
+            profile = {
+              id: fbUser.uid,
+              name: fbUser.displayName || fbUser.email?.split('@')[0] || 'Student',
+              email: fbUser.email || '',
+              createdAt: Date.now(),
+              lastLoginAt: Date.now(),
+            };
+          }
+          setCurrentUser(profile);
+        } catch (error) {
+          console.error("Auth state processing error:", error);
+          setCurrentUser(null);
+        }
+      } else {
+        setCurrentUser(null);
+        setUnverifiedFirebaseUser(null);
+      }
+      setAuthLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Load User Data from Firestore upon verified login
+  useEffect(() => {
+    if (!currentUser) {
+      setSettings(DEFAULT_SETTINGS);
+      setCalibration(DEFAULT_CALIBRATION);
+      setStudentProfiles([]);
+      setActiveStudentId('');
+      setSessions([]);
+      return;
     }
+
+    const loadUserData = async () => {
+      try {
+        const [loadedSettings, loadedCalib, loadedProfiles, loadedSessions] = await Promise.all([
+          getFirestoreSettings(currentUser.id),
+          getFirestoreCalibration(currentUser.id),
+          getFirestoreStudentProfiles(currentUser.id),
+          getFirestoreStudySessions(currentUser.id),
+        ]);
+
+        if (loadedSettings) {
+          setSettings(loadedSettings);
+        } else {
+          setSettings(DEFAULT_SETTINGS);
+        }
+
+        if (loadedCalib) {
+          setCalibration(loadedCalib);
+        } else {
+          setCalibration(DEFAULT_CALIBRATION);
+        }
+
+        if (loadedProfiles && loadedProfiles.length > 0) {
+          setStudentProfiles(loadedProfiles);
+          setActiveStudentId(loadedProfiles[0].id);
+        } else {
+          // Create initial default profile for new user in Firestore
+          const defaultProfile: StudentProfile = {
+            id: `profile-${currentUser.id}-primary`,
+            name: currentUser.name || 'Student Profile',
+            avatarColor: '#4f46e5',
+            baselineYaw: 0,
+            baselinePitch: 0,
+            baselineRoll: 0,
+            baselineGazeX: 0,
+            baselineGazeY: 0,
+            baselineFaceX: 0.5,
+            baselineFaceY: 0.5,
+            baselineFaceScale: 1.0,
+            isCalibrated: false,
+            yawLimit: 20,
+            pitchLimit: 15,
+            gazeLimit: 20,
+            facePosTolerance: 25,
+            distractionDelay: 5,
+            preset: 'normal',
+            outOfFocusBoundaryEnabled: true,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          };
+          setStudentProfiles([defaultProfile]);
+          setActiveStudentId(defaultProfile.id);
+          saveFirestoreStudentProfile(currentUser.id, defaultProfile).catch(e => console.error(e));
+        }
+
+        if (loadedSessions) {
+          setSessions(loadedSessions);
+        } else {
+          setSessions([]);
+        }
+      } catch (err) {
+        console.error("Failed to load user data from Firestore:", err);
+      }
+    };
+
+    loadUserData();
   }, [currentUser?.id]);
 
-  // Active student profile derived
+  // Derived Active Student Profile
   const activeProfile = useMemo(() => {
     const profiles = Array.isArray(studentProfiles) && studentProfiles.length > 0 ? studentProfiles : [];
     return profiles.find(p => p.id === activeStudentId) || profiles[0] || {
@@ -93,7 +235,7 @@ export default function App() {
     const profiles = Array.isArray(studentProfiles) ? studentProfiles : [];
     const nextProfiles = profiles.map(p => (p.id === updated.id ? updated : p));
     setStudentProfiles(nextProfiles);
-    saveStoredStudentProfiles(nextProfiles, currentUser.id);
+    saveFirestoreStudentProfile(currentUser.id, updated).catch(err => console.error(err));
   };
 
   const handleCreateProfile = (name: string) => {
@@ -124,9 +266,8 @@ export default function App() {
     };
     const nextProfiles = [...profiles, newProfile];
     setStudentProfiles(nextProfiles);
-    saveStoredStudentProfiles(nextProfiles, currentUser.id);
     setActiveStudentId(newProfile.id);
-    saveStoredActiveStudentId(newProfile.id, currentUser.id);
+    saveFirestoreStudentProfile(currentUser.id, newProfile).catch(err => console.error(err));
   };
 
   const handleDeleteProfile = (id: string) => {
@@ -135,34 +276,30 @@ export default function App() {
     if (profiles.length <= 1) return;
     const nextProfiles = profiles.filter(p => p.id !== id);
     setStudentProfiles(nextProfiles);
-    saveStoredStudentProfiles(nextProfiles, currentUser.id);
     if (activeStudentId === id) {
       setActiveStudentId(nextProfiles[0].id);
-      saveStoredActiveStudentId(nextProfiles[0].id, currentUser.id);
     }
+    deleteFirestoreStudentProfile(currentUser.id, id).catch(err => console.error(err));
   };
 
   const handleSelectStudent = (id: string) => {
-    if (!currentUser) return;
     setActiveStudentId(id);
-    saveStoredActiveStudentId(id, currentUser.id);
   };
 
   // Save settings on update
   const handleUpdateSettings = (updated: AppSettings) => {
     if (!currentUser) return;
     setSettings(updated);
-    saveStoredSettings(updated, currentUser.id);
+    saveFirestoreSettings(currentUser.id, updated).catch(err => console.error(err));
   };
 
   // Save calibration on completion
   const handleCalibrationComplete = (calib: CalibrationData) => {
     if (!currentUser) return;
     setCalibration(calib);
-    saveStoredCalibration(calib, currentUser.id);
     setIsCalibrating(false);
+    saveFirestoreCalibration(currentUser.id, calib).catch(err => console.error(err));
 
-    // Also update active student profile's baseline
     if (activeProfile) {
       const updatedProfile: StudentProfile = {
         ...activeProfile,
@@ -178,13 +315,14 @@ export default function App() {
     }
   };
 
-  // Save completed session
+  // Save completed session to Firestore
   const handleSessionComplete = (session: StudySession) => {
     if (!currentUser) return;
-    const updated = addStudySession(session, currentUser.id);
-    setSessions(updated);
+    const next = [session, ...sessions];
+    setSessions(next);
     setCompletedSession(session);
     setFocusState('IDLE');
+    saveFirestoreStudySession(currentUser.id, session).catch(err => console.error(err));
   };
 
   // Update session from summary modal (with notes & AI Coach summary)
@@ -192,43 +330,35 @@ export default function App() {
     if (!currentUser) return;
     const updated = sessions.map(s => (s.id === updatedSession.id ? updatedSession : s));
     setSessions(updated);
-    saveStoredSessions(updated, currentUser.id);
     setCompletedSession(null);
+    saveFirestoreStudySession(currentUser.id, updatedSession).catch(err => console.error(err));
   };
 
   const handleDeleteSession = (id: string) => {
     if (!currentUser) return;
-    const updated = deleteStudySession(id, currentUser.id);
+    const updated = sessions.filter(s => s.id !== id);
     setSessions(updated);
+    deleteFirestoreStudySession(currentUser.id, id).catch(err => console.error(err));
   };
 
   const handleClearSessions = () => {
     if (!currentUser) return;
-    clearAllUserSessions(currentUser.id);
     setSessions([]);
+    clearAllFirestoreStudySessions(currentUser.id).catch(err => console.error(err));
   };
 
   const handleClearAllData = () => {
     if (!currentUser) return;
-    clearAllUserSessions(currentUser.id);
     setSessions([]);
-    const defaultSettings = getStoredSettings(currentUser.id);
-    setSettings(defaultSettings);
+    clearAllFirestoreStudySessions(currentUser.id).catch(err => console.error(err));
+    setSettings(DEFAULT_SETTINGS);
+    saveFirestoreSettings(currentUser.id, DEFAULT_SETTINGS).catch(err => console.error(err));
   };
 
   const handleResetCalibration = () => {
     if (!currentUser) return;
-    const neutral: CalibrationData = {
-      baselineYaw: 0,
-      baselinePitch: 0,
-      baselineRoll: 0,
-      baselineGazeX: 0,
-      baselineGazeY: 0,
-      baselineFaceScale: 1.0,
-      isCalibrated: false,
-    };
-    setCalibration(neutral);
-    saveStoredCalibration(neutral, currentUser.id);
+    setCalibration(DEFAULT_CALIBRATION);
+    saveFirestoreCalibration(currentUser.id, DEFAULT_CALIBRATION).catch(err => console.error(err));
 
     if (activeProfile) {
       handleUpdateProfile({
@@ -244,7 +374,7 @@ export default function App() {
     }
   };
 
-  // Calculate today's study minutes
+  // Calculate today's study minutes purely from user's verified Firestore sessions
   const todayStudyMinutes = useMemo(() => {
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
@@ -265,19 +395,44 @@ export default function App() {
     }
   };
 
-  const executeLogout = () => {
-    logoutUser();
+  const executeLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.error('Firebase signOut error:', e);
+    }
     setCurrentUser(null);
+    setUnverifiedFirebaseUser(null);
     setFocusState('IDLE');
     setIsCalibrating(false);
     setShowLogoutProtectionModal(false);
   };
 
-  // If user is not logged in, render the Auth View
-  if (!currentUser) {
-    return <AuthView onAuthSuccess={(user) => setCurrentUser(user)} />;
+  // 1. Loading Authentication State Screen
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center text-white space-y-4">
+        <Loader2 className="w-8 h-8 animate-spin text-indigo-500" />
+        <p className="text-sm font-medium text-slate-300">Checking Firebase authentication...</p>
+      </div>
+    );
   }
 
+  // 2. Unauthenticated or Unverified User Screen
+  if (!currentUser) {
+    return (
+      <AuthView
+        unverifiedUser={unverifiedFirebaseUser}
+        onClearUnverified={() => setUnverifiedFirebaseUser(null)}
+        onAuthSuccess={(user) => {
+          setUnverifiedFirebaseUser(null);
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
+
+  // 3. Authenticated & Verified Dashboard
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-slate-800 flex flex-col font-sans selection:bg-indigo-500/20 selection:text-indigo-700">
       
@@ -393,7 +548,7 @@ export default function App() {
                 Active Study Session in Progress
               </h3>
               <p className="text-xs text-slate-600 leading-relaxed">
-                Your study session is still running. Please end your study session to record your focus statistics before logging out.
+                Your study session is still running. Please end your study session to record your focus statistics to Firestore before logging out.
               </p>
             </div>
 
@@ -423,7 +578,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
             <p className="text-slate-600 font-medium">
-              StudyFocus AI &bull; Private On-Device Vision Engine &bull; User: {currentUser.name}
+              StudyFocus AI &bull; Firebase Auth & Cloud Firestore &bull; User: {currentUser.name}
             </p>
           </div>
           <div className="flex items-center gap-4 text-slate-500 font-medium">

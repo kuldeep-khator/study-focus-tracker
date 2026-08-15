@@ -3,6 +3,19 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
+import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
+import {
+  getOrCreateUser,
+  getStudentProfiles,
+  upsertStudentProfile,
+  deleteStudentProfileDb,
+  getStudySessions,
+  saveStudySessionDb,
+  deleteStudySessionDb,
+  clearAllStudySessionsDb,
+  getUserSettingsDb,
+  updateUserSettingsDb,
+} from "./src/db/queries.ts";
 
 dotenv.config();
 
@@ -16,7 +29,7 @@ function getGeminiClient(): GoogleGenAI | null {
       apiKey: process.env.GEMINI_API_KEY,
       httpOptions: {
         headers: {
-          'User-Agent': 'aistudio-build',
+          "User-Agent": "aistudio-build",
         },
       },
     });
@@ -35,17 +48,137 @@ async function startServer() {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
-  // API: AI Study Coach Analysis (Only receives statistics, NEVER raw video/images!)
+  // API: Sync/Fetch authenticated user & initialize cloud record
+  app.post("/api/auth/sync", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const email = req.user!.email || `${uid}@studyaid.app`;
+      const name = req.body?.name || req.user!.name || "Student";
+      const user = await getOrCreateUser(uid, email, name);
+      res.json({ user });
+    } catch (error: any) {
+      console.error("Auth sync error:", error);
+      res.status(500).json({ error: error.message || "Failed to sync user" });
+    }
+  });
+
+  // API: Student Profiles
+  app.get("/api/profiles", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const profiles = await getStudentProfiles(uid);
+      res.json({ profiles });
+    } catch (error: any) {
+      console.error("Get profiles error:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch profiles" });
+    }
+  });
+
+  app.post("/api/profiles", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const profile = req.body;
+      const saved = await upsertStudentProfile(uid, profile);
+      res.json({ profile: saved });
+    } catch (error: any) {
+      console.error("Save profile error:", error);
+      res.status(500).json({ error: error.message || "Failed to save profile" });
+    }
+  });
+
+  app.delete("/api/profiles/:id", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const profileId = req.params.id;
+      await deleteStudentProfileDb(uid, profileId);
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Delete profile error:", error);
+      res.status(500).json({ error: error.message || "Failed to delete profile" });
+    }
+  });
+
+  // API: Study Sessions
+  app.get("/api/sessions", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const sessions = await getStudySessions(uid);
+      res.json({ sessions });
+    } catch (error: any) {
+      console.error("Get sessions error:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch study sessions" });
+    }
+  });
+
+  app.post("/api/sessions", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const session = req.body;
+      const saved = await saveStudySessionDb(uid, session);
+      res.json({ session: saved });
+    } catch (error: any) {
+      console.error("Save session error:", error);
+      res.status(500).json({ error: error.message || "Failed to save study session" });
+    }
+  });
+
+  app.delete("/api/sessions/:id", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const sessionId = req.params.id;
+      await deleteStudySessionDb(uid, sessionId);
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Delete session error:", error);
+      res.status(500).json({ error: error.message || "Failed to delete study session" });
+    }
+  });
+
+  app.delete("/api/sessions", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      await clearAllStudySessionsDb(uid);
+      res.json({ success: true });
+    } catch (error: any) {
+      console.error("Clear sessions error:", error);
+      res.status(500).json({ error: error.message || "Failed to clear study sessions" });
+    }
+  });
+
+  // API: User Settings
+  app.get("/api/settings", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const settings = await getUserSettingsDb(uid);
+      res.json({ settings });
+    } catch (error: any) {
+      console.error("Get settings error:", error);
+      res.status(500).json({ error: error.message || "Failed to fetch settings" });
+    }
+  });
+
+  app.post("/api/settings", requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const settings = req.body;
+      const saved = await updateUserSettingsDb(uid, settings);
+      res.json({ settings: saved });
+    } catch (error: any) {
+      console.error("Save settings error:", error);
+      res.status(500).json({ error: error.message || "Failed to save settings" });
+    }
+  });
+
+  // API: AI Study Coach Analysis
   app.post("/api/ai/coach-advice", async (req, res) => {
     try {
       const { sessionStats, recentHistory } = req.body;
       const ai = getGeminiClient();
 
       if (!ai) {
-        // Return structured smart feedback locally if Gemini API key isn't provided
         return res.json({
           feedback: generateLocalCoachFeedback(sessionStats),
-          source: "local-heuristic"
+          source: "local-heuristic",
         });
       }
 
@@ -72,18 +205,18 @@ Provide:
         config: {
           systemInstruction: "You are an empathetic, evidence-informed study coach for students. Be concise, warm, practical, and inspiring.",
           temperature: 0.7,
-        }
+        },
       });
 
       res.json({
         feedback: response.text || generateLocalCoachFeedback(sessionStats),
-        source: "gemini"
+        source: "gemini",
       });
     } catch (error) {
       console.error("Gemini Coach Error:", error);
       res.json({
         feedback: generateLocalCoachFeedback(req.body?.sessionStats),
-        source: "local-heuristic-fallback"
+        source: "local-heuristic-fallback",
       });
     }
   });

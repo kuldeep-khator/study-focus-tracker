@@ -1,0 +1,41 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if user owns the document path
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // User Root Document
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Student Profiles Subcollection
+      match /studentProfiles/{profileId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Settings Subcollection or doc
+      match /settings/{settingId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Calibration Subcollection or doc
+      match /calibration/{calibrationId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Study Sessions Subcollection
+      match /studySessions/{sessionId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+  }
+}

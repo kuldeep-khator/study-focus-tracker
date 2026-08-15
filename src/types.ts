@@ -2,8 +2,9 @@ export interface User {
   id: string;
   name: string;
   email: string;
-  passwordHash: string;
+  passwordHash?: string;
   createdAt: number;
+  lastLoginAt?: number;
 }
 
 export type SessionLifecycleState = 

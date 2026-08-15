@@ -417,14 +417,15 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     };
   }, [shouldCameraRun, startCamera, stopCameraStream]);
 
-  // Robust Main Frame Processing Loop (Runs via requestAnimationFrame ONLY when camera is active)
+  // Robust Main Frame Processing Loop (Uses requestAnimationFrame when tab is visible AND setInterval fallback for background tabs/switching apps)
   useEffect(() => {
     if (!shouldCameraRun && !settings.simulationMode) return;
 
     let animationId: number;
+    let backgroundIntervalId: NodeJS.Timeout | null = null;
     let fallbackCounter = 0;
 
-    const processFrame = async () => {
+    const processSingleFrame = async () => {
       if (!isMountedRef.current) return;
 
       const video = videoRef.current;
@@ -448,13 +449,43 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
           }
         }
       }
-
-      animationId = requestAnimationFrame(processFrame);
     };
 
-    animationId = requestAnimationFrame(processFrame);
+    const runRafLoop = () => {
+      if (document.hidden) return;
+      processSingleFrame().finally(() => {
+        if (!document.hidden && isMountedRef.current) {
+          animationId = requestAnimationFrame(runRafLoop);
+        }
+      });
+    };
+
+    // When tab is visible, run high-frequency rAF loop
+    if (!document.hidden) {
+      animationId = requestAnimationFrame(runRafLoop);
+    }
+
+    // Always maintain background interval timer (e.g. every 200ms) to ensure continuous monitoring even when browser throttles background tabs
+    backgroundIntervalId = setInterval(() => {
+      if (document.hidden) {
+        processSingleFrame();
+      }
+    }, 200);
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        // Tab became visible again -> kick off rAF loop
+        cancelAnimationFrame(animationId);
+        animationId = requestAnimationFrame(runRafLoop);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
       if (animationId) cancelAnimationFrame(animationId);
+      if (backgroundIntervalId) clearInterval(backgroundIntervalId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [shouldCameraRun, settings.simulationMode, estimateOpticalPose]);
 

@@ -2,13 +2,20 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Play, Pause, Square, Sparkles, Clock, Target, Flame, AlertTriangle, 
   Settings2, RefreshCw, Volume2, VolumeX, ShieldCheck, Crosshair, 
-  ChevronRight, Compass, Maximize2, Minimize2, CheckCircle2, User, Eye, EyeOff, AlertCircle
+  ChevronRight, Compass, Maximize2, Minimize2, CheckCircle2, User, Eye, EyeOff, AlertCircle,
+  Activity, Bell, Monitor, RefreshCcw
 } from 'lucide-react';
 import { 
   AppSettings, CalibrationData, DistractionDetail, FocusInterval, 
   FocusState, StudentProfile, StudySession, TrackerMetrics, SessionLifecycleState 
 } from '../types';
 import { CameraTracker } from './CameraTracker';
+import { 
+  saveActiveSessionState, 
+  loadActiveSessionState, 
+  clearActiveSessionState, 
+  ActiveSessionStorageData 
+} from '../utils/sessionManager';
 
 interface ActiveSessionViewProps {
   settings: AppSettings;
@@ -61,12 +68,18 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
   const [isCustomSubject, setIsCustomSubject] = useState<boolean>(false);
   const [sessionNotes, setSessionNotes] = useState<string>('');
   const [isCameraUnavailable, setIsCameraUnavailable] = useState<boolean>(false);
+  const [cameraUnavailableSeconds, setCameraUnavailableSeconds] = useState<number>(0);
+
+  // Interrupted session recovery state
+  const [interruptedSession, setInterruptedSession] = useState<ActiveSessionStorageData | null>(null);
 
   // High-precision Wall-Clock Timestamp State
+  const sessionIdRef = useRef<string>(`session-${Date.now()}`);
   const sessionStartTimestampRef = useRef<number>(0);
   const sessionEndTimestampRef = useRef<number>(0);
   const pauseStartTimestampRef = useRef<number>(0);
   const totalPausedMsRef = useRef<number>(0);
+  const lastTickTimeRef = useRef<number>(Date.now());
 
   // Live session statistics
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
@@ -95,12 +108,22 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     rawRoll: 0,
     rawGazeX: 0,
     rawGazeY: 0,
+    rawFaceX: 0.5,
+    rawFaceY: 0.5,
     faceDetected: false,
     eyeContact: false,
     state: 'IDLE',
     distractionSeconds: 0,
+    fps: 30,
     confidence: 0,
     isWithinBounds: true,
+    leftEyeEAR: 0.3,
+    rightEyeEAR: 0.3,
+    isBlinking: false,
+    boundViolations: { yaw: false, pitch: false, gaze: false, facePos: false, noFace: false },
+    allowedYawRange: [-20, 20],
+    allowedPitchRange: [-15, 15],
+    allowedGazeRange: [-20, 20],
   });
 
   // Automatic notification banner state
@@ -113,6 +136,59 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
 
   const isActive = lifecycleState === 'ACTIVE' || lifecycleState === 'PAUSED' || lifecycleState === 'CAMERA_UNAVAILABLE';
   const isPaused = lifecycleState === 'PAUSED';
+
+  // Check for interrupted active session on initial mount
+  useEffect(() => {
+    if (!userId) return;
+    const existing = loadActiveSessionState(userId);
+    if (existing && (existing.lifecycleState === 'ACTIVE' || existing.lifecycleState === 'PAUSED' || existing.lifecycleState === 'CAMERA_UNAVAILABLE')) {
+      const now = Date.now();
+      const timeSinceHeartbeat = now - (existing.lastHeartbeatTimestamp || existing.sessionStartTimestamp);
+      // If session was saved less than 24 hours ago, offer recovery
+      if (timeSinceHeartbeat < 24 * 60 * 60 * 1000) {
+        setInterruptedSession(existing);
+      } else {
+        clearActiveSessionState(userId);
+      }
+    }
+  }, [userId]);
+
+  // Handle Resume Interrupted Session
+  const handleRecoverSession = () => {
+    if (!interruptedSession) return;
+    sessionIdRef.current = interruptedSession.sessionId || `session-${Date.now()}`;
+    sessionStartTimestampRef.current = interruptedSession.sessionStartTimestamp;
+    pauseStartTimestampRef.current = interruptedSession.pauseStartTimestamp || 0;
+    totalPausedMsRef.current = interruptedSession.totalPausedMs || 0;
+    
+    // Calculate gap during app closure and add as camera unavailable time
+    const now = Date.now();
+    const gapSeconds = Math.max(0, Math.floor((now - (interruptedSession.lastHeartbeatTimestamp || now)) / 1000));
+    const previousUnavailable = interruptedSession.cameraUnavailableSeconds || 0;
+    setCameraUnavailableSeconds(previousUnavailable + gapSeconds);
+
+    setSubject(interruptedSession.subject || 'Computer Science & Coding');
+    setElapsedSeconds(interruptedSession.focusedSeconds + interruptedSession.distractionSeconds + previousUnavailable + gapSeconds);
+    setFocusedSeconds(interruptedSession.focusedSeconds || 0);
+    setDistractionSeconds(interruptedSession.distractionSeconds || 0);
+    setDistractionCount(interruptedSession.distractionCount || 0);
+    setLongestStreak(interruptedSession.longestStreak || 0);
+    setCurrentStreak(interruptedSession.currentStreak || 0);
+    setIntervals(interruptedSession.intervals || []);
+    setDistractionLog(interruptedSession.distractions || []);
+    setSessionNotes(interruptedSession.notes || '');
+
+    setLifecycleState('ACTIVE');
+    setInterruptedSession(null);
+  };
+
+  // Handle Discard Interrupted Session
+  const handleDiscardInterruptedSession = () => {
+    if (userId) {
+      clearActiveSessionState(userId);
+    }
+    setInterruptedSession(null);
+  };
 
   // Format seconds to HH:MM:SS or MM:SS
   const formatTime = (secs: number) => {
@@ -172,8 +248,10 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
 
   // Start Study Session Handler
   const handleStartSession = () => {
+    sessionIdRef.current = `session-${Date.now()}`;
     sessionStartTimestampRef.current = Date.now();
     totalPausedMsRef.current = 0;
+    lastTickTimeRef.current = Date.now();
     setLifecycleState('ACTIVE');
     setElapsedSeconds(0);
     setFocusedSeconds(0);
@@ -183,6 +261,7 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     setLongestStreak(0);
     setIntervals([]);
     setDistractionLog([]);
+    setCameraUnavailableSeconds(0);
     activeDistractionRef.current = null;
   };
 
@@ -198,10 +277,11 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       totalPausedMsRef.current += (Date.now() - pauseStartTimestampRef.current);
       pauseStartTimestampRef.current = 0;
     }
+    lastTickTimeRef.current = Date.now();
     setLifecycleState('ACTIVE');
   };
 
-  // End Study Session Handler (Releases camera, computes exact metrics, saves session)
+  // End Study Session Handler (Releases camera, computes exact metrics, saves session, clears active session cache)
   const handleEndSession = () => {
     sessionEndTimestampRef.current = Date.now();
     setLifecycleState('ENDED');
@@ -212,13 +292,14 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       1
     );
 
-    const calculatedFocused = Math.max(totalDuration - distractionSeconds, 0);
-    const finalScore = Math.min(100, Math.max(0, Math.round((calculatedFocused / totalDuration) * 100)));
+    const calculatedFocused = Math.max(totalDuration - distractionSeconds - cameraUnavailableSeconds, 0);
+    const denominator = calculatedFocused + distractionSeconds;
+    const finalScore = denominator > 0 ? Math.min(100, Math.max(0, Math.round((calculatedFocused / denominator) * 100))) : 100;
 
     const chosenSubject = isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject;
 
     const finalSession: StudySession = {
-      id: `session-${Date.now()}`,
+      id: sessionIdRef.current || `session-${Date.now()}`,
       userId,
       studentId: activeProfile.id,
       studentName: activeProfile.name,
@@ -234,58 +315,95 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       notes: sessionNotes.trim() || undefined,
       intervals: intervals.length > 0 ? intervals : [{ state: 'focused', startSecond: 0, endSecond: totalDuration }],
       distractions: distractionLog,
+      cameraUnavailableSeconds: cameraUnavailableSeconds > 0 ? cameraUnavailableSeconds : undefined,
     };
+
+    if (userId) {
+      clearActiveSessionState(userId);
+    }
 
     onPlaySound('completed');
     onSessionComplete(finalSession);
     setLifecycleState('IDLE');
   };
 
-  // High-Precision Main Session Clock (1-Second Ticker synced with wall-clock)
+  // Periodic Local Storage Sync & True Timestamp-based Background Clock
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (lifecycleState === 'ACTIVE') {
       interval = setInterval(() => {
+        const now = Date.now();
+        const deltaSeconds = Math.max(1, Math.round((now - lastTickTimeRef.current) / 1000));
+        lastTickTimeRef.current = now;
+
         // Calculate true wall-clock elapsed time
         const currentElapsed = Math.max(
           0,
-          Math.floor((Date.now() - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000)
+          Math.floor((now - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000)
         );
         setElapsedSeconds(currentElapsed);
 
         // Update focused vs distraction time based on current status
-        if (metrics.state === 'FOCUSED') {
-          setFocusedSeconds(prev => prev + 1);
+        if (isCameraUnavailable) {
+          setCameraUnavailableSeconds(prev => prev + deltaSeconds);
+        } else if (metrics.state === 'FOCUSED') {
+          setFocusedSeconds(prev => prev + deltaSeconds);
           setCurrentStreak(prev => {
-            const next = prev + 1;
+            const next = prev + deltaSeconds;
             setLongestStreak(longest => Math.max(longest, next));
             return next;
           });
         } else if (metrics.state === 'DISTRACTED') {
-          setDistractionSeconds(prev => prev + 1);
+          setDistractionSeconds(prev => prev + deltaSeconds);
           setCurrentStreak(0);
         } else if (metrics.state === 'DRIFTING' || metrics.state === 'NO_FACE') {
           // Drifting under threshold counts as study time before distraction triggers
-          setFocusedSeconds(prev => prev + 1);
+          setFocusedSeconds(prev => prev + deltaSeconds);
         }
 
         // Maintain live focus intervals (chunks of 5-10s)
         setIntervals(prev => {
-          const currentState = metrics.state === 'DISTRACTED' ? 'distracted' : metrics.state === 'NO_FACE' ? 'away' : 'focused';
+          const currentState = isCameraUnavailable ? 'away' : metrics.state === 'DISTRACTED' ? 'distracted' : metrics.state === 'NO_FACE' ? 'away' : 'focused';
           if (prev.length === 0) {
-            return [{ state: currentState, startSecond: 0, endSecond: 1 }];
+            return [{ state: currentState, startSecond: 0, endSecond: deltaSeconds }];
           }
           const last = prev[prev.length - 1];
           if (last.state === currentState) {
-            return [...prev.slice(0, -1), { ...last, endSecond: last.endSecond + 1 }];
+            return [...prev.slice(0, -1), { ...last, endSecond: last.endSecond + deltaSeconds }];
           } else {
-            return [...prev, { state: currentState, startSecond: last.endSecond, endSecond: last.endSecond + 1 }];
+            return [...prev, { state: currentState, startSecond: last.endSecond, endSecond: last.endSecond + deltaSeconds }];
           }
         });
+
+        // Persist live session state to localStorage
+        if (userId) {
+          saveActiveSessionState({
+            userId,
+            sessionId: sessionIdRef.current,
+            lifecycleState: 'ACTIVE',
+            subject: isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject,
+            studentId: activeProfile.id,
+            studentName: activeProfile.name,
+            sessionStartTimestamp: sessionStartTimestampRef.current,
+            pauseStartTimestamp: pauseStartTimestampRef.current,
+            totalPausedMs: totalPausedMsRef.current,
+            lastHeartbeatTimestamp: now,
+            focusedSeconds,
+            distractionSeconds,
+            distractionCount,
+            longestStreak,
+            currentStreak,
+            intervals,
+            distractions: distractionLog,
+            notes: sessionNotes,
+            cameraUnavailableSeconds,
+            lastCameraAvailabilityCheck: now,
+          });
+        }
       }, 1000);
     }
     return () => clearInterval(interval);
-  }, [lifecycleState, metrics.state]);
+  }, [lifecycleState, metrics.state, isCameraUnavailable, userId, subject, isCustomSubject, customSubjectText, activeProfile, focusedSeconds, distractionSeconds, distractionCount, longestStreak, currentStreak, intervals, distractionLog, sessionNotes, cameraUnavailableSeconds]);
 
   // Distraction Event Started (Fires strictly once when sustained threshold is crossed)
   const handleDistractionEventStart = ({ startTimestamp, reason }: { startTimestamp: number; reason: string }) => {
@@ -304,9 +422,10 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     // Trigger Native Browser Notification if backgrounded / permitted
     if (settings.browserNotifications && 'Notification' in window && Notification.permission === 'granted') {
       try {
-        new Notification('Study Focus Alert', {
-          body: `${activeProfile.name}, please return your focus to your study screen.`,
+        new Notification('🔔 Study Focus Alert', {
+          body: `${activeProfile.name}, you appear to be distracted. Let's get back to studying!`,
           icon: '/favicon.ico',
+          tag: 'study-focus-distraction',
         });
       } catch (e) {
         console.debug('Notification trigger caught:', e);
@@ -391,6 +510,75 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      
+      {/* INTERRUPTED SESSION RECOVERY MODAL / BANNER */}
+      {interruptedSession && (
+        <div className="p-4 sm:p-5 rounded-2xl bg-amber-50 border border-amber-300 shadow-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-100 border border-amber-300 flex items-center justify-center text-amber-700 shrink-0">
+              <RefreshCcw className="w-5 h-5 animate-spin-slow" />
+            </div>
+            <div>
+              <h4 className="text-sm font-bold text-amber-900 font-display">
+                Your previous study session was interrupted
+              </h4>
+              <p className="text-xs text-amber-800 leading-relaxed mt-0.5">
+                Subject: <strong>{interruptedSession.subject}</strong> &bull; Recorded Study Time: <strong>{formatTime(interruptedSession.focusedSeconds + interruptedSession.distractionSeconds)}</strong> ({interruptedSession.distractionCount} distractions). Would you like to resume?
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+            <button
+              id="btn-discard-interrupted-session"
+              onClick={handleDiscardInterruptedSession}
+              className="px-3.5 py-2 rounded-xl text-xs font-semibold text-slate-600 bg-white border border-slate-300 hover:bg-slate-50 transition-colors cursor-pointer"
+            >
+              Discard
+            </button>
+            <button
+              id="btn-resume-interrupted-session"
+              onClick={handleRecoverSession}
+              className="px-4 py-2 rounded-xl text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 transition-colors cursor-pointer shadow-xs"
+            >
+              Resume Session
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* BACKGROUND PERSISTENT SESSION ACTIVE INDICATOR BANNER */}
+      {isActive && (
+        <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5">
+            <span className="relative flex h-3 w-3">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+            </span>
+            <span className="font-bold text-emerald-950">
+              🟢 Persistent Background Study Session Active
+            </span>
+            <span className="text-emerald-700 hidden sm:inline">&bull;</span>
+            <span className="text-emerald-800 font-medium hidden sm:inline">
+              Switching tabs, windows, or minimizing does NOT stop this session.
+            </span>
+          </div>
+          <div className="flex items-center gap-4 font-mono font-bold text-emerald-950">
+            <span>Study Time: {formatTime(elapsedSeconds)}</span>
+            <span>Focus: {liveFocusScore}%</span>
+            <span>Distractions: {distractionCount}</span>
+          </div>
+        </div>
+      )}
+
+      {/* CAMERA UNAVAILABLE IN BACKGROUND WARNING BANNER */}
+      {isCameraUnavailable && isActive && (
+        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-300 text-amber-900 flex items-center gap-3 text-xs">
+          <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+          <div>
+            <strong className="font-bold">Background monitoring is temporarily unavailable.</strong> Please return to the app or allow background camera access in your browser/OS settings. (This interval is tracked as unavailable rather than focused time).
+          </div>
+        </div>
+      )}
       
       {/* Top Banner / Student Profile Selector & Quick Session Controls */}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-4 rounded-2xl bg-white border border-slate-200 shadow-xs">

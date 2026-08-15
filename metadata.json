@@ -1,0 +1,6 @@
+{
+  "name": "Study Focus Tracker",
+  "description": "Real-time AI-powered study focus tracker with webcam face, eye direction, and head pose analysis, smart distraction alerts, and comprehensive study analytics.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

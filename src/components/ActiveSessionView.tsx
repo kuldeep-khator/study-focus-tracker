@@ -1,0 +1,808 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { 
+  Play, Pause, Square, Sparkles, Clock, Target, Flame, AlertTriangle, 
+  Settings2, RefreshCw, Volume2, VolumeX, ShieldCheck, Crosshair, 
+  ChevronRight, Compass, Maximize2, Minimize2, CheckCircle2, User, Eye, EyeOff, AlertCircle
+} from 'lucide-react';
+import { 
+  AppSettings, CalibrationData, DistractionDetail, FocusInterval, 
+  FocusState, StudentProfile, StudySession, TrackerMetrics, SessionLifecycleState 
+} from '../types';
+import { CameraTracker } from './CameraTracker';
+
+interface ActiveSessionViewProps {
+  settings: AppSettings;
+  activeProfile: StudentProfile;
+  profiles: StudentProfile[];
+  onSelectProfile: (id: string) => void;
+  onOpenCalibration: () => void;
+  onCalibrationComplete: (calib: CalibrationData) => void;
+  onSessionComplete: (session: StudySession) => void;
+  onPlaySound: (type: 'distraction' | 'restored' | 'completed') => void;
+  isCalibrating: boolean;
+  onStartCalibration: () => void;
+  onCancelCalibration: () => void;
+  onMetricsUpdate?: (metrics: TrackerMetrics) => void;
+  userId: string;
+}
+
+const COMMON_SUBJECTS = [
+  'Mathematics & Calculus',
+  'Physics & Engineering',
+  'Computer Science & Coding',
+  'Biology & Medicine',
+  'Chemistry',
+  'Literature & Writing',
+  'History & Social Sciences',
+  'Language Learning',
+  'Exam Preparation',
+  'Custom Subject',
+];
+
+export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
+  settings,
+  activeProfile,
+  profiles,
+  onSelectProfile,
+  onOpenCalibration,
+  onCalibrationComplete,
+  onSessionComplete,
+  onPlaySound,
+  isCalibrating,
+  onStartCalibration,
+  onCancelCalibration,
+  onMetricsUpdate,
+  userId,
+}) => {
+  // Session Lifecycle State Machine
+  const [lifecycleState, setLifecycleState] = useState<SessionLifecycleState>('IDLE');
+  const [subject, setSubject] = useState<string>('Computer Science & Coding');
+  const [customSubjectText, setCustomSubjectText] = useState<string>('');
+  const [isCustomSubject, setIsCustomSubject] = useState<boolean>(false);
+  const [sessionNotes, setSessionNotes] = useState<string>('');
+  const [isCameraUnavailable, setIsCameraUnavailable] = useState<boolean>(false);
+
+  // High-precision Wall-Clock Timestamp State
+  const sessionStartTimestampRef = useRef<number>(0);
+  const sessionEndTimestampRef = useRef<number>(0);
+  const pauseStartTimestampRef = useRef<number>(0);
+  const totalPausedMsRef = useRef<number>(0);
+
+  // Live session statistics
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
+  const [focusedSeconds, setFocusedSeconds] = useState<number>(0);
+  const [distractionSeconds, setDistractionSeconds] = useState<number>(0);
+  const [distractionCount, setDistractionCount] = useState<number>(0);
+  const [currentStreak, setCurrentStreak] = useState<number>(0);
+  const [longestStreak, setLongestStreak] = useState<number>(0);
+
+  // Distraction Events Array
+  const [distractionLog, setDistractionLog] = useState<DistractionDetail[]>([]);
+  const activeDistractionRef = useRef<{ id: string; startTimestamp: number; reason: string } | null>(null);
+
+  // Focus Intervals Chunk Array (for timeline rendering)
+  const [intervals, setIntervals] = useState<FocusInterval[]>([]);
+
+  // Live vision metrics from computer vision pipeline
+  const [metrics, setMetrics] = useState<TrackerMetrics>({
+    yaw: 0,
+    pitch: 0,
+    roll: 0,
+    gazeX: 0,
+    gazeY: 0,
+    rawYaw: 0,
+    rawPitch: 0,
+    rawRoll: 0,
+    rawGazeX: 0,
+    rawGazeY: 0,
+    faceDetected: false,
+    eyeContact: false,
+    state: 'IDLE',
+    distractionSeconds: 0,
+    confidence: 0,
+    isWithinBounds: true,
+  });
+
+  // Automatic notification banner state
+  const [notification, setNotification] = useState<{ 
+    message: string; 
+    subMessage?: string; 
+    visible: boolean; 
+    type: 'distraction' | 'encouragement' | 'info' 
+  } | null>(null);
+
+  const isActive = lifecycleState === 'ACTIVE' || lifecycleState === 'PAUSED' || lifecycleState === 'CAMERA_UNAVAILABLE';
+  const isPaused = lifecycleState === 'PAUSED';
+
+  // Format seconds to HH:MM:SS or MM:SS
+  const formatTime = (secs: number) => {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    if (h > 0) {
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // Live Focus Score calculation
+  const liveFocusScore = useMemo(() => {
+    const active = focusedSeconds + distractionSeconds;
+    if (active <= 0) return 100;
+    return Math.min(100, Math.max(0, Math.round((focusedSeconds / active) * 100)));
+  }, [focusedSeconds, distractionSeconds]);
+
+  // Request browser notification permissions on mount if enabled
+  useEffect(() => {
+    if (settings.browserNotifications && 'Notification' in window) {
+      if (Notification.permission === 'default') {
+        Notification.requestPermission();
+      }
+    }
+  }, [settings.browserNotifications]);
+
+  // Handle Metrics Update from CameraTracker
+  const handleMetricsUpdate = (newMetrics: TrackerMetrics) => {
+    setMetrics(newMetrics);
+    onMetricsUpdate?.(newMetrics);
+  };
+
+  // 1-Click Pose Snapshot Baseline handler
+  const handleQuickSnapshotBaseline = () => {
+    onCalibrationComplete({
+      baselineYaw: metrics.rawYaw,
+      baselinePitch: metrics.rawPitch,
+      baselineRoll: metrics.rawRoll,
+      baselineGazeX: metrics.rawGazeX,
+      baselineGazeY: metrics.rawGazeY,
+      baselineFaceScale: 1.0,
+      isCalibrated: true,
+      calibratedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    });
+    setNotification({
+      message: `Posture baseline snapshot captured for ${activeProfile.name}!`,
+      subMessage: `Reference locked to Yaw: ${metrics.rawYaw >= 0 ? '+' : ''}${metrics.rawYaw}°, Pitch: ${metrics.rawPitch >= 0 ? '+' : ''}${metrics.rawPitch}°, Gaze: ${metrics.rawGazeX >= 0 ? '+' : ''}${metrics.rawGazeX}°`,
+      visible: true,
+      type: 'encouragement',
+    });
+    setTimeout(() => {
+      setNotification(prev => (prev?.type === 'encouragement' ? { ...prev, visible: false } : prev));
+    }, 4000);
+  };
+
+  // Start Study Session Handler
+  const handleStartSession = () => {
+    sessionStartTimestampRef.current = Date.now();
+    totalPausedMsRef.current = 0;
+    setLifecycleState('ACTIVE');
+    setElapsedSeconds(0);
+    setFocusedSeconds(0);
+    setDistractionSeconds(0);
+    setDistractionCount(0);
+    setCurrentStreak(0);
+    setLongestStreak(0);
+    setIntervals([]);
+    setDistractionLog([]);
+    activeDistractionRef.current = null;
+  };
+
+  // Pause Study Session Handler
+  const handlePauseSession = () => {
+    pauseStartTimestampRef.current = Date.now();
+    setLifecycleState('PAUSED');
+  };
+
+  // Resume Study Session Handler
+  const handleResumeSession = () => {
+    if (pauseStartTimestampRef.current > 0) {
+      totalPausedMsRef.current += (Date.now() - pauseStartTimestampRef.current);
+      pauseStartTimestampRef.current = 0;
+    }
+    setLifecycleState('ACTIVE');
+  };
+
+  // End Study Session Handler (Releases camera, computes exact metrics, saves session)
+  const handleEndSession = () => {
+    sessionEndTimestampRef.current = Date.now();
+    setLifecycleState('ENDED');
+
+    const totalDuration = Math.max(
+      Math.floor((sessionEndTimestampRef.current - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000),
+      elapsedSeconds,
+      1
+    );
+
+    const calculatedFocused = Math.max(totalDuration - distractionSeconds, 0);
+    const finalScore = Math.min(100, Math.max(0, Math.round((calculatedFocused / totalDuration) * 100)));
+
+    const chosenSubject = isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject;
+
+    const finalSession: StudySession = {
+      id: `session-${Date.now()}`,
+      userId,
+      studentId: activeProfile.id,
+      studentName: activeProfile.name,
+      startTime: sessionStartTimestampRef.current,
+      endTime: sessionEndTimestampRef.current,
+      duration: totalDuration,
+      focusedTime: calculatedFocused,
+      distractionTime: distractionSeconds,
+      distractionCount,
+      focusScore: finalScore,
+      longestStreak: Math.max(longestStreak, currentStreak),
+      subject: chosenSubject,
+      notes: sessionNotes.trim() || undefined,
+      intervals: intervals.length > 0 ? intervals : [{ state: 'focused', startSecond: 0, endSecond: totalDuration }],
+      distractions: distractionLog,
+    };
+
+    onPlaySound('completed');
+    onSessionComplete(finalSession);
+    setLifecycleState('IDLE');
+  };
+
+  // High-Precision Main Session Clock (1-Second Ticker synced with wall-clock)
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (lifecycleState === 'ACTIVE') {
+      interval = setInterval(() => {
+        // Calculate true wall-clock elapsed time
+        const currentElapsed = Math.max(
+          0,
+          Math.floor((Date.now() - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000)
+        );
+        setElapsedSeconds(currentElapsed);
+
+        // Update focused vs distraction time based on current status
+        if (metrics.state === 'FOCUSED') {
+          setFocusedSeconds(prev => prev + 1);
+          setCurrentStreak(prev => {
+            const next = prev + 1;
+            setLongestStreak(longest => Math.max(longest, next));
+            return next;
+          });
+        } else if (metrics.state === 'DISTRACTED') {
+          setDistractionSeconds(prev => prev + 1);
+          setCurrentStreak(0);
+        } else if (metrics.state === 'DRIFTING' || metrics.state === 'NO_FACE') {
+          // Drifting under threshold counts as study time before distraction triggers
+          setFocusedSeconds(prev => prev + 1);
+        }
+
+        // Maintain live focus intervals (chunks of 5-10s)
+        setIntervals(prev => {
+          const currentState = metrics.state === 'DISTRACTED' ? 'distracted' : metrics.state === 'NO_FACE' ? 'away' : 'focused';
+          if (prev.length === 0) {
+            return [{ state: currentState, startSecond: 0, endSecond: 1 }];
+          }
+          const last = prev[prev.length - 1];
+          if (last.state === currentState) {
+            return [...prev.slice(0, -1), { ...last, endSecond: last.endSecond + 1 }];
+          } else {
+            return [...prev, { state: currentState, startSecond: last.endSecond, endSecond: last.endSecond + 1 }];
+          }
+        });
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [lifecycleState, metrics.state]);
+
+  // Distraction Event Started (Fires strictly once when sustained threshold is crossed)
+  const handleDistractionEventStart = ({ startTimestamp, reason }: { startTimestamp: number; reason: string }) => {
+    setDistractionCount(prev => prev + 1);
+    activeDistractionRef.current = {
+      id: `d-${Date.now()}`,
+      startTimestamp,
+      reason,
+    };
+
+    // Play gentle synthesized chime if sound enabled
+    if (settings.audioAlerts) {
+      onPlaySound('distraction');
+    }
+
+    // Trigger Native Browser Notification if backgrounded / permitted
+    if (settings.browserNotifications && 'Notification' in window && Notification.permission === 'granted') {
+      try {
+        new Notification('Study Focus Alert', {
+          body: `${activeProfile.name}, please return your focus to your study screen.`,
+          icon: '/favicon.ico',
+        });
+      } catch (e) {
+        console.debug('Notification trigger caught:', e);
+      }
+    }
+
+    // Show automatic non-intrusive notification toast
+    setNotification({
+      message: 'You appear to be looking away. Please return your focus to your study.',
+      subMessage: reason || 'Sustained distraction boundary violation',
+      visible: true,
+      type: 'distraction',
+    });
+
+    setTimeout(() => {
+      setNotification(prev => (prev?.type === 'distraction' ? { ...prev, visible: false } : prev));
+    }, 6000);
+  };
+
+  // Distraction Event Ended (Fires when student returns to focus boundary)
+  const handleDistractionEventEnd = ({
+    startTimestamp,
+    endTimestamp,
+    durationSeconds,
+    reason,
+  }: {
+    startTimestamp: number;
+    endTimestamp: number;
+    durationSeconds: number;
+    reason: string;
+  }) => {
+    const reasonType: DistractionDetail['reason'] = reason.includes('head')
+      ? 'head_turned'
+      : reason.includes('eye') || reason.includes('gaze')
+      ? 'gaze_away'
+      : 'face_missing';
+
+    const newDistraction: DistractionDetail = {
+      id: activeDistractionRef.current?.id || `d-${Date.now()}`,
+      secondInSession: elapsedSeconds,
+      startTimestamp,
+      endTimestamp,
+      timestamp: startTimestamp,
+      reason: reasonType,
+      reasonDescription: reason,
+      durationSeconds,
+    };
+
+    setDistractionLog(prev => [...prev, newDistraction]);
+    activeDistractionRef.current = null;
+  };
+
+  // Focus Restored Trigger
+  const handleFocusRestored = () => {
+    if (settings.audioAlerts) {
+      onPlaySound('restored');
+    }
+
+    setNotification({
+      message: "Focus restored! You're back inside the study area.",
+      subMessage: `Reference point locked to ${activeProfile.name}`,
+      visible: true,
+      type: 'encouragement',
+    });
+
+    setTimeout(() => {
+      setNotification(prev => (prev?.type === 'encouragement' ? { ...prev, visible: false } : prev));
+    }, 3500);
+  };
+
+  // Camera Availability Handler
+  const handleCameraUnavailable = (unavailable: boolean) => {
+    setIsCameraUnavailable(unavailable);
+    if (unavailable && lifecycleState === 'ACTIVE') {
+      setLifecycleState('CAMERA_UNAVAILABLE');
+    } else if (!unavailable && lifecycleState === 'CAMERA_UNAVAILABLE') {
+      setLifecycleState('ACTIVE');
+    }
+  };
+
+  const currentSubjectName = isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject;
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      
+      {/* Top Banner / Student Profile Selector & Quick Session Controls */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-4 rounded-2xl bg-white border border-slate-200 shadow-xs">
+        
+        {/* Left: Active Student & Subject Info */}
+        <div className="flex flex-wrap items-center gap-3">
+          
+          {/* Active Student Chip */}
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200">
+            <div 
+              className="w-3.5 h-3.5 rounded-full shrink-0"
+              style={{ backgroundColor: activeProfile.avatarColor || '#4f46e5' }}
+            />
+            <div className="flex flex-col">
+              <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Student Profile</span>
+              {!isActive ? (
+                <select
+                  id="select-active-student"
+                  value={activeProfile.id}
+                  onChange={(e) => onSelectProfile(e.target.value)}
+                  className="text-xs font-semibold text-slate-900 bg-transparent border-none p-0 focus:ring-0 cursor-pointer pr-4"
+                >
+                  {profiles.map(p => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} {p.isCalibrated ? '✓' : ''}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="text-xs font-semibold text-slate-900">{activeProfile.name}</span>
+              )}
+            </div>
+          </div>
+
+          {/* Subject Selector / Custom Input */}
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="flex flex-col">
+              <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Study Subject</span>
+              {!isActive ? (
+                <div className="flex items-center gap-1.5">
+                  <select
+                    id="select-study-subject"
+                    value={isCustomSubject ? 'Custom Subject' : subject}
+                    onChange={(e) => {
+                      if (e.target.value === 'Custom Subject') {
+                        setIsCustomSubject(true);
+                      } else {
+                        setIsCustomSubject(false);
+                        setSubject(e.target.value);
+                      }
+                    }}
+                    className="text-xs font-semibold text-slate-900 bg-transparent border-none p-0 focus:ring-0 cursor-pointer pr-4"
+                  >
+                    {COMMON_SUBJECTS.map(s => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                  {isCustomSubject && (
+                    <input
+                      id="input-custom-subject"
+                      type="text"
+                      placeholder="Type custom subject..."
+                      value={customSubjectText}
+                      onChange={(e) => setCustomSubjectText(e.target.value)}
+                      className="text-xs px-2 py-0.5 border border-slate-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    />
+                  )}
+                </div>
+              ) : (
+                <span className="text-xs font-semibold text-slate-900">{currentSubjectName}</span>
+              )}
+            </div>
+          </div>
+
+        </div>
+
+        {/* Right: Primary Session Action Buttons */}
+        <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+          {!isActive ? (
+            <button
+              id="btn-start-study-session"
+              onClick={handleStartSession}
+              className="w-full sm:w-auto px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Play className="w-4 h-4 fill-white" />
+              <span>Start Study Session</span>
+            </button>
+          ) : (
+            <div className="flex items-center gap-2 w-full sm:w-auto">
+              {isPaused ? (
+                <button
+                  id="btn-resume-session"
+                  onClick={handleResumeSession}
+                  className="flex-1 sm:flex-initial px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Play className="w-3.5 h-3.5 fill-white" />
+                  <span>Resume</span>
+                </button>
+              ) : (
+                <button
+                  id="btn-pause-session"
+                  onClick={handlePauseSession}
+                  className="flex-1 sm:flex-initial px-4 py-2 rounded-xl text-xs font-semibold bg-amber-500 hover:bg-amber-600 text-white transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Pause className="w-3.5 h-3.5 fill-white" />
+                  <span>Pause</span>
+                </button>
+              )}
+
+              <button
+                id="btn-end-study-session"
+                onClick={handleEndSession}
+                className="flex-1 sm:flex-initial px-4 py-2 rounded-xl text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <Square className="w-3.5 h-3.5 fill-white" />
+                <span>End Study Session</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {/* Main Grid: Telemetry & Live Video */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* Left Column: Live Video Camera Feed & Interactive HUD */}
+        <div className="lg:col-span-7 space-y-4">
+          
+          {/* Live Status & Calibration Bar */}
+          <div className="flex items-center justify-between px-1 text-xs text-slate-500">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-slate-700">Computer Vision Feed:</span>
+              <span className="font-mono text-indigo-600 font-medium">
+                {activeProfile.name} {activeProfile.preset ? `(${activeProfile.preset})` : ''}
+              </span>
+            </div>
+            <button
+              id="btn-trigger-calibration-inline"
+              onClick={onStartCalibration}
+              className="text-xs text-indigo-600 hover:text-indigo-700 font-medium transition-colors cursor-pointer flex items-center gap-1"
+            >
+              <Crosshair className="w-3 h-3" />
+              {activeProfile.isCalibrated ? 'Recalibrate Pose' : 'Calibrate Baseline'}
+            </button>
+          </div>
+
+          {/* Camera Component */}
+          <CameraTracker
+            isActive={isActive}
+            isPaused={isPaused}
+            settings={settings}
+            activeProfile={activeProfile}
+            onCalibrationComplete={onCalibrationComplete}
+            onMetricsUpdate={handleMetricsUpdate}
+            onDistractionEventStart={handleDistractionEventStart}
+            onDistractionEventEnd={handleDistractionEventEnd}
+            onFocusRestored={handleFocusRestored}
+            onCameraUnavailable={handleCameraUnavailable}
+            isCalibrating={isCalibrating}
+            onCancelCalibration={onCancelCalibration}
+            onStartSession={handleStartSession}
+          />
+
+          {/* Real-time Angle & Telemetry Card with Baseline vs Current vs Allowed Comparison */}
+          <div className="p-4 rounded-xl bg-white border border-slate-200 shadow-xs space-y-3.5 text-xs">
+            <div className="flex items-center justify-between text-slate-600">
+              <span className="font-semibold text-slate-800 flex items-center gap-1.5">
+                <Compass className="w-3.5 h-3.5 text-indigo-600" />
+                Live Pose vs Baseline ({activeProfile.name})
+              </span>
+              <span className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded ${
+                metrics.isWithinBounds ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'
+              }`}>
+                {metrics.isWithinBounds ? 'SAFE ZONE' : 'OUTSIDE BOUNDARY'}
+              </span>
+            </div>
+
+            {/* Quick Calibration Bar */}
+            <div className="flex items-center justify-between p-2 rounded-lg bg-indigo-50/70 border border-indigo-100">
+              <div className="text-[11px] text-slate-600">
+                <span>Baseline Status: </span>
+                <strong className="text-indigo-900 font-semibold">
+                  {activeProfile.isCalibrated 
+                    ? `Locked at ${activeProfile.calibratedAt || 'Recent'}` 
+                    : 'Factory Center (Not yet tuned)'}
+                </strong>
+              </div>
+              <button
+                id="btn-lock-current-pose"
+                onClick={handleQuickSnapshotBaseline}
+                className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold transition-colors cursor-pointer flex items-center gap-1"
+                title="Lock current head and gaze orientation as student's normal study baseline"
+              >
+                <Crosshair className="w-3 h-3" />
+                <span>1-Click Pose Snapshot</span>
+              </button>
+            </div>
+
+            {/* 3-Column Angular HUD Comparison Grid */}
+            <div className="grid grid-cols-3 gap-2.5 font-mono text-[11px]">
+              
+              {/* Yaw Comparison Block */}
+              <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
+                  <span>Head Yaw</span>
+                  <span className="text-slate-400">Limit: ±{activeProfile.yawLimit || 20}°</span>
+                </div>
+                <div className="text-slate-900 font-bold">
+                  Live: {metrics.rawYaw >= 0 ? '+' : ''}{metrics.rawYaw}°
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  Base: {activeProfile.baselineYaw >= 0 ? '+' : ''}{activeProfile.baselineYaw}°
+                </div>
+                <div className={`text-[10px] font-semibold ${
+                  Math.abs(metrics.yaw) > (activeProfile.yawLimit || 20) ? 'text-rose-600' : 'text-emerald-600'
+                }`}>
+                  Diff: {metrics.yaw >= 0 ? '+' : ''}{metrics.yaw}°
+                </div>
+              </div>
+
+              {/* Pitch Comparison Block */}
+              <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
+                  <span>Head Pitch</span>
+                  <span className="text-slate-400">Limit: ±{activeProfile.pitchLimit || 15}°</span>
+                </div>
+                <div className="text-slate-900 font-bold">
+                  Live: {metrics.rawPitch >= 0 ? '+' : ''}{metrics.rawPitch}°
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  Base: {activeProfile.baselinePitch >= 0 ? '+' : ''}{activeProfile.baselinePitch}°
+                </div>
+                <div className={`text-[10px] font-semibold ${
+                  Math.abs(metrics.pitch) > (activeProfile.pitchLimit || 15) ? 'text-rose-600' : 'text-emerald-600'
+                }`}>
+                  Diff: {metrics.pitch >= 0 ? '+' : ''}{metrics.pitch}°
+                </div>
+              </div>
+
+              {/* Gaze Comparison Block */}
+              <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
+                  <span>Eye Gaze</span>
+                  <span className="text-slate-400">Limit: ±{activeProfile.gazeLimit || 20}°</span>
+                </div>
+                <div className="text-slate-900 font-bold">
+                  Live: {metrics.rawGazeX >= 0 ? '+' : ''}{metrics.rawGazeX}°
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  Base: {activeProfile.baselineGazeX >= 0 ? '+' : ''}{activeProfile.baselineGazeX}°
+                </div>
+                <div className={`text-[10px] font-semibold ${
+                  Math.abs(metrics.gazeX) > (activeProfile.gazeLimit || 20) ? 'text-rose-600' : 'text-emerald-600'
+                }`}>
+                  Diff: {metrics.gazeX >= 0 ? '+' : ''}{metrics.gazeX}°
+                </div>
+              </div>
+
+            </div>
+
+            {/* Delay Threshold Info */}
+            <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100">
+              <span>Distraction Delay Window:</span>
+              <span className="font-semibold text-slate-700 font-mono">
+                {activeProfile.distractionDelay || settings.distractionThreshold || 5}s sustained look-away required to trigger alert
+              </span>
+            </div>
+          </div>
+
+        </div>
+
+        {/* Right Column: Live Session Statistics & Timeline */}
+        <div className="lg:col-span-5 space-y-4">
+          
+          {/* Main Timer & Focus Score Card */}
+          <div className="p-5 rounded-2xl bg-white border border-slate-200 shadow-xs space-y-4">
+            
+            {/* Top Timer Display */}
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 block mb-0.5">
+                  Session Timer
+                </span>
+                <div className="text-3xl sm:text-4xl font-mono font-bold text-slate-900 tracking-tight">
+                  {formatTime(elapsedSeconds)}
+                </div>
+              </div>
+
+              {/* Focus Score Radial Metric */}
+              <div className="text-right">
+                <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 block mb-0.5">
+                  Focus Score
+                </span>
+                <div className={`text-3xl sm:text-4xl font-mono font-bold ${
+                  liveFocusScore >= 80 ? 'text-emerald-600' : liveFocusScore >= 60 ? 'text-amber-600' : 'text-rose-600'
+                }`}>
+                  {liveFocusScore}%
+                </div>
+              </div>
+            </div>
+
+            {/* Focused vs Distraction Progress Bar */}
+            <div className="space-y-1.5">
+              <div className="h-3 w-full rounded-full bg-slate-100 overflow-hidden flex">
+                <div 
+                  className="h-full bg-emerald-500 transition-all duration-300"
+                  style={{ width: `${liveFocusScore}%` }}
+                />
+                <div 
+                  className="h-full bg-rose-500 transition-all duration-300"
+                  style={{ width: `${100 - liveFocusScore}%` }}
+                />
+              </div>
+              <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                <span className="text-emerald-700 font-medium">Focused: {formatTime(focusedSeconds)}</span>
+                <span className="text-rose-700 font-medium">Distracted: {formatTime(distractionSeconds)}</span>
+              </div>
+            </div>
+
+            {/* Quick Metrics Grid */}
+            <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-100">
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <span className="text-[11px] text-slate-500 block">Distractions Count</span>
+                <span className="text-lg font-bold font-mono text-slate-900">{distractionCount}</span>
+              </div>
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <span className="text-[11px] text-slate-500 block">Current Focus Streak</span>
+                <span className="text-lg font-bold font-mono text-emerald-700">{formatTime(currentStreak)}</span>
+              </div>
+            </div>
+
+            {/* Session Notes Input */}
+            <div className="pt-2 border-t border-slate-100">
+              <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                Session Goals & Notes (Optional)
+              </label>
+              <textarea
+                id="textarea-session-notes"
+                value={sessionNotes}
+                onChange={(e) => setSessionNotes(e.target.value)}
+                placeholder="E.g. Finishing chapter 4 problem set, studying algorithms..."
+                rows={2}
+                className="w-full text-xs p-2 rounded-lg border border-slate-200 focus:ring-1 focus:ring-indigo-500 focus:outline-none resize-none"
+              />
+            </div>
+
+          </div>
+
+          {/* Distraction Events Log Card */}
+          <div className="p-4 rounded-2xl bg-white border border-slate-200 shadow-xs space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-500" />
+                <span>Distraction Log ({distractionLog.length})</span>
+              </h3>
+              <span className="text-[11px] text-slate-400">
+                {distractionLog.length === 0 ? 'Zero distractions' : 'Logged events'}
+              </span>
+            </div>
+
+            {distractionLog.length === 0 ? (
+              <div className="py-6 text-center text-xs text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-200">
+                <CheckCircle2 className="w-5 h-5 text-emerald-500 mx-auto mb-1" />
+                <p>Great attention! No sustained distractions recorded yet.</p>
+              </div>
+            ) : (
+              <div className="max-h-48 overflow-y-auto space-y-2 pr-1">
+                {distractionLog.slice(-6).reverse().map((d, i) => (
+                  <div key={d.id || i} className="p-2 rounded-lg bg-rose-50/70 border border-rose-100 flex items-center justify-between text-xs">
+                    <div>
+                      <span className="font-semibold text-rose-900 block">
+                        {d.reason === 'head_turned' ? 'Head turned away' : d.reason === 'gaze_away' ? 'Eyes looking away' : 'Face left study area'}
+                      </span>
+                      <span className="text-[10px] text-rose-600 font-mono">
+                        At {formatTime(d.secondInSession)} in session &bull; {d.durationSeconds}s duration
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono font-bold text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded">
+                      +{d.durationSeconds}s
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+        </div>
+
+      </div>
+
+      {/* Floating Alert / Encouragement Notification Banner */}
+      {notification && notification.visible && (
+        <div className={`fixed bottom-6 right-6 z-50 p-4 rounded-2xl shadow-xl border flex items-start gap-3 max-w-sm transition-all duration-300 ${
+          notification.type === 'distraction'
+            ? 'bg-rose-900 text-white border-rose-700 shadow-rose-900/30'
+            : 'bg-indigo-900 text-white border-indigo-700 shadow-indigo-900/30'
+        }`}>
+          {notification.type === 'distraction' ? (
+            <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+          ) : (
+            <Sparkles className="w-5 h-5 text-indigo-300 shrink-0 mt-0.5" />
+          )}
+          <div className="space-y-0.5">
+            <p className="text-xs font-bold leading-tight">{notification.message}</p>
+            {notification.subMessage && (
+              <p className="text-[11px] opacity-80 leading-tight">{notification.subMessage}</p>
+            )}
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+};

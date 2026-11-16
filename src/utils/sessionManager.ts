@@ -21,6 +21,10 @@ export interface ActiveSessionStorageData {
   notes?: string;
   cameraUnavailableSeconds: number;
   lastCameraAvailabilityCheck: number;
+  postureScoreSum?: number;
+  postureSampleCount?: number;
+  uprightPostureSeconds?: number;
+  slouchPostureSeconds?: number;
 }
 
 const STORAGE_KEY_PREFIX = 'studyfocus_active_session_';

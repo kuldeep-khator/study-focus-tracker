@@ -190,13 +190,14 @@ Analyze their study session statistics:
 - Focus Score: ${sessionStats?.focusScore || 0}%
 - Distraction Events: ${sessionStats?.distractionCount || 0}
 - Longest Focused Streak: ${Math.round((sessionStats?.longestStreak || 0) / 60)} minutes
+- Upper Body Posture Score: ${typeof sessionStats?.avgPostureScore === "number" ? `${sessionStats.avgPostureScore}% (${sessionStats?.postureSummary || "Monitored"})` : "Not recorded"}
 - Subject/Topic: ${sessionStats?.subject || "General Study"}
 
 Recent sessions context: ${recentHistory ? JSON.stringify(recentHistory) : "First recorded session"}
 
 Provide:
-1. A warm 2-sentence celebration or gentle reflection on their focus ratio.
-2. 2 concrete, bite-sized recommendations for their next session based on their specific distraction patterns (e.g. Pomodoro intervals, desk ergonomics, screen distance, or micro-breaks).
+1. A warm 2-sentence celebration or gentle reflection on their focus ratio and upper body posture.
+2. 2 concrete, bite-sized recommendations for their next session based on their specific distraction and posture patterns (e.g. Pomodoro intervals, desk ergonomics, eye-level screen height, shoulder alignment, or micro-breaks).
 3. A motivational closing mantra. Keep it concise, friendly, and empowering. Avoid clichés or medical claims.`;
 
       const response = await ai.models.generateContent({
@@ -245,6 +246,7 @@ function generateLocalCoachFeedback(stats: any): string {
   const score = stats?.focusScore || 0;
   const durationMin = Math.round((stats?.duration || 0) / 60);
   const distractions = stats?.distractionCount || 0;
+  const postureScore = typeof stats?.avgPostureScore === "number" ? stats.avgPostureScore : null;
 
   let assessment = "";
   if (score >= 85) {
@@ -258,7 +260,9 @@ function generateLocalCoachFeedback(stats: any): string {
   const tip1 = score < 75 
     ? "Try using 25-minute Pomodoro intervals to prevent attention fatigue before distractions mount."
     : "Your gaze alignment remained steady—keep positioning your study notes directly within your natural line of sight.";
-  const tip2 = distractions > 5
+  const tip2 = postureScore !== null && postureScore < 75
+    ? `Your upper body posture averaged ${postureScore}%. Raise your screen closer to eye level and roll your shoulders back every 15 minutes.`
+    : distractions > 5
     ? "Place your phone in another room or use website blockers to minimize peripheral movement triggers."
     : "Stay well-hydrated and do a 2-minute posture stretch before your next deep work sprint.";
 

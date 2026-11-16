@@ -1,21 +1,27 @@
 import React, { useState } from 'react';
 import { 
-  History, Calendar, Clock, Target, Flame, AlertTriangle, 
-  Trash2, Search, ChevronDown, ChevronUp, Bot, FileText, Download 
+  History, Calendar, Clock, Trash2, Search, ChevronDown, ChevronUp, 
+  Bot, FileText, Download, Mail, Activity, CheckCircle2 
 } from 'lucide-react';
 import { StudySession } from '../types';
+import { EmailSessionModal } from './EmailSessionModal';
 
 interface SessionHistoryViewProps {
   sessions: StudySession[];
+  userEmail?: string;
+  onUpdateSession?: (updated: StudySession) => void;
   onDeleteSession: (id: string) => void;
 }
 
 export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
   sessions,
+  userEmail = '',
+  onUpdateSession,
   onDeleteSession,
 }) => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [emailModalSession, setEmailModalSession] = useState<StudySession | null>(null);
 
   const filteredSessions = sessions.filter(s => {
     const term = searchQuery.toLowerCase();
@@ -53,7 +59,7 @@ export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
             Study Session History
           </h2>
           <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-            Detailed log of your deep work blocks and distraction analytics
+            Detailed log of your deep work blocks, upper body posture, distraction analytics, and email reports
           </p>
         </div>
 
@@ -108,9 +114,29 @@ export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
                       {session.focusScore}%
                     </div>
                     <div>
-                      <h3 className="text-sm sm:text-base font-bold text-slate-900 font-display">
-                        {session.subject || 'General Study'}
-                      </h3>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm sm:text-base font-bold text-slate-900 font-display">
+                          {session.subject || 'General Study'}
+                        </h3>
+                        {typeof session.avgPostureScore === 'number' && (
+                          <span className={`inline-flex items-center gap-1 text-[11px] font-mono font-semibold px-2 py-0.5 rounded-md border ${
+                            session.avgPostureScore >= 80
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              : session.avgPostureScore >= 60
+                              ? 'bg-amber-50 text-amber-700 border-amber-200'
+                              : 'bg-rose-50 text-rose-700 border-rose-200'
+                          }`}>
+                            <Activity className="w-3 h-3" />
+                            Posture: {session.avgPostureScore}%
+                          </span>
+                        )}
+                        {session.emailedTo && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-700 border border-indigo-200">
+                            <CheckCircle2 className="w-3 h-3 text-indigo-600" />
+                            Emailed to {session.emailedTo}
+                          </span>
+                        )}
+                      </div>
                       <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500 mt-1">
                         <span className="flex items-center gap-1">
                           <Calendar className="w-3.5 h-3.5 text-slate-400" />
@@ -136,6 +162,18 @@ export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
                         <span className="text-slate-700 font-semibold">{session.distractionCount}</span>
                       </div>
                     </div>
+
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEmailModalSession(session);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-[11px] font-semibold transition-colors cursor-pointer"
+                      title="Send or resend this saved session log via Gmail"
+                    >
+                      <Mail className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">{session.emailedTo ? 'Resend' : 'Email Log'}</span>
+                    </button>
 
                     <button
                       className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
@@ -178,6 +216,22 @@ export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
                       </div>
                     </div>
 
+                    {/* Upper Body Posture Card (if recorded) */}
+                    {typeof session.avgPostureScore === 'number' && (
+                      <div className="p-3.5 rounded-xl bg-emerald-50/60 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-2 text-emerald-900">
+                          <Activity className="w-4 h-4 text-emerald-600 shrink-0" />
+                          <span>
+                            <strong>Upper Body Posture:</strong> {session.avgPostureScore}% &mdash; {session.postureSummary || 'Tracked'}
+                          </span>
+                        </div>
+                        <div className="font-mono text-[11px] text-slate-700 flex items-center gap-3">
+                          <span>Upright: <strong>{formatMinSec(session.uprightPostureTime || 0)}</strong></span>
+                          <span>Slouch: <strong>{formatMinSec(session.slouchPostureTime || 0)}</strong></span>
+                        </div>
+                      </div>
+                    )}
+
                     {/* AI Coach Summary (if generated) */}
                     {session.aiSummary && (
                       <div className="p-4 rounded-xl bg-indigo-50/70 border border-indigo-100 space-y-1.5">
@@ -204,18 +258,31 @@ export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
                       </div>
                     )}
 
-                    {/* Actions: Export JSON or Delete */}
-                    <div className="flex items-center justify-between pt-2 border-t border-slate-200/80 text-xs">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          exportSingleSessionJson(session);
-                        }}
-                        className="flex items-center gap-1.5 text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        Export Raw JSON
-                      </button>
+                    {/* Actions: Email, Export JSON or Delete */}
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200/80 text-xs">
+                      <div className="flex items-center gap-4">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEmailModalSession(session);
+                          }}
+                          className="flex items-center gap-1.5 text-indigo-600 hover:text-indigo-800 font-semibold transition-colors cursor-pointer"
+                        >
+                          <Mail className="w-3.5 h-3.5" />
+                          {session.emailedTo ? 'Resend Saved Log via Email' : 'Send Saved Log via Email'}
+                        </button>
+
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            exportSingleSessionJson(session);
+                          }}
+                          className="flex items-center gap-1.5 text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Export Raw JSON
+                        </button>
+                      </div>
 
                       <button
                         id={`btn-delete-session-${session.id}`}
@@ -247,6 +314,19 @@ export const SessionHistoryView: React.FC<SessionHistoryViewProps> = ({
             {searchQuery ? 'No sessions match your search query.' : 'Complete your first study session to build your personal deep-work archive!'}
           </p>
         </div>
+      )}
+
+      {/* Email Confirmation Dialog */}
+      {emailModalSession && (
+        <EmailSessionModal
+          session={emailModalSession}
+          defaultRecipientEmail={userEmail}
+          onClose={() => setEmailModalSession(null)}
+          onEmailSent={(updatedSession) => {
+            onUpdateSession?.(updatedSession);
+            setEmailModalSession(updatedSession);
+          }}
+        />
       )}
     </div>
   );

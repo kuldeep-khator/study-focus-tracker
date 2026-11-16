@@ -2,25 +2,38 @@ import React, { useEffect, useState } from 'react';
 import confetti from 'canvas-confetti';
 import { 
   Trophy, Clock, Target, AlertTriangle, Sparkles, Check, 
-  Flame, BookOpen, Share2, ArrowRight, Bot, Loader2 
+  Flame, Bot, Loader2, Activity, Mail, CheckCircle2 
 } from 'lucide-react';
 import { StudySession } from '../types';
+import { EmailSessionModal } from './EmailSessionModal';
 
 interface SessionSummaryModalProps {
   session: StudySession;
+  userEmail?: string;
+  autoOpenEmailPrompt?: boolean;
   onSaveAndClose: (updatedSession: StudySession) => void;
+  onUpdateSession?: (updatedSession: StudySession) => void;
   onStartNewSession: () => void;
 }
 
 export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
   session,
+  userEmail = '',
+  autoOpenEmailPrompt = false,
   onSaveAndClose,
+  onUpdateSession,
   onStartNewSession,
 }) => {
+  const [currentSession, setCurrentSession] = useState<StudySession>(session);
   const [subject, setSubject] = useState<string>(session.subject || 'General Study');
   const [notes, setNotes] = useState<string>(session.notes || '');
   const [aiFeedback, setAiFeedback] = useState<string>(session.aiSummary || '');
   const [isLoadingAi, setIsLoadingAi] = useState<boolean>(false);
+  const [showEmailModal, setShowEmailModal] = useState<boolean>(autoOpenEmailPrompt);
+
+  useEffect(() => {
+    setCurrentSession(session);
+  }, [session]);
 
   // Trigger confetti burst on completion
   useEffect(() => {
@@ -60,12 +73,14 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionStats: {
-            duration: session.duration,
-            focusedTime: session.focusedTime,
-            distractionTime: session.distractionTime,
-            focusScore: session.focusScore,
-            distractionCount: session.distractionCount,
-            longestStreak: session.longestStreak,
+            duration: currentSession.duration,
+            focusedTime: currentSession.focusedTime,
+            distractionTime: currentSession.distractionTime,
+            focusScore: currentSession.focusScore,
+            distractionCount: currentSession.distractionCount,
+            longestStreak: currentSession.longestStreak,
+            avgPostureScore: currentSession.avgPostureScore,
+            postureSummary: currentSession.postureSummary,
             subject,
           },
         }),
@@ -81,14 +96,22 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
     }
   };
 
+  const buildUpdatedSession = (): StudySession => ({
+    ...currentSession,
+    subject,
+    notes,
+    aiSummary: aiFeedback,
+  });
+
   const handleSave = () => {
-    const updated: StudySession = {
-      ...session,
-      subject,
-      notes,
-      aiSummary: aiFeedback,
-    };
-    onSaveAndClose(updated);
+    onSaveAndClose(buildUpdatedSession());
+  };
+
+  const handleOpenEmailDialog = () => {
+    const updated = buildUpdatedSession();
+    setCurrentSession(updated);
+    onUpdateSession?.(updated);
+    setShowEmailModal(true);
   };
 
   return (
@@ -104,7 +127,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
             Study Session Complete 🎉
           </h2>
           <p className="text-xs sm:text-sm text-slate-600 max-w-md mx-auto">
-            {getPerformanceMessage(session.focusScore)}
+            {getPerformanceMessage(currentSession.focusScore)}
           </p>
         </div>
 
@@ -116,7 +139,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
               <span>Study Time</span>
             </div>
             <p className="text-2xl font-bold font-mono text-slate-900">
-              {formatMinSec(session.duration)}
+              {formatMinSec(currentSession.duration)}
             </p>
           </div>
 
@@ -126,7 +149,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
               <span>Focused Time</span>
             </div>
             <p className="text-2xl font-bold font-mono text-emerald-600">
-              {formatMinSec(session.focusedTime)}
+              {formatMinSec(currentSession.focusedTime)}
             </p>
           </div>
 
@@ -136,7 +159,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
               <span>Focus Score</span>
             </div>
             <p className="text-2xl font-bold font-mono text-amber-600">
-              {session.focusScore}%
+              {currentSession.focusScore}%
             </p>
           </div>
 
@@ -146,7 +169,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
               <span>Distracted Time</span>
             </div>
             <p className="text-lg sm:text-xl font-bold font-mono text-red-600">
-              {formatMinSec(session.distractionTime)}
+              {formatMinSec(currentSession.distractionTime)}
             </p>
           </div>
 
@@ -156,7 +179,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
               <span>Distraction Events</span>
             </div>
             <p className="text-lg sm:text-xl font-bold font-mono text-slate-900">
-              {session.distractionCount}
+              {currentSession.distractionCount}
             </p>
           </div>
 
@@ -166,10 +189,43 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
               <span>Longest Streak</span>
             </div>
             <p className="text-lg sm:text-xl font-bold font-mono text-indigo-600">
-              {formatMinSec(session.longestStreak)}
+              {formatMinSec(currentSession.longestStreak)}
             </p>
           </div>
         </div>
+
+        {/* Upper Body Posture Summary Card */}
+        {typeof currentSession.avgPostureScore === 'number' && (
+          <div className="p-4 rounded-xl bg-emerald-50/70 border border-emerald-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-white border border-emerald-200 flex items-center justify-center text-emerald-600 shrink-0">
+                <Activity className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-xs font-bold text-emerald-950 uppercase tracking-wider">
+                  Upper Body Posture Summary
+                </h3>
+                <p className="text-xs text-emerald-900 mt-0.5">
+                  {currentSession.postureSummary || 'Upper body ergonomics monitored throughout session.'}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-4 font-mono text-xs shrink-0">
+              <div className="text-center">
+                <span className="text-[10px] text-emerald-700 uppercase block">Score</span>
+                <span className="text-lg font-bold text-emerald-700">{currentSession.avgPostureScore}%</span>
+              </div>
+              <div className="text-center">
+                <span className="text-[10px] text-emerald-700 uppercase block">Upright</span>
+                <span className="font-bold text-slate-800">{formatMinSec(currentSession.uprightPostureTime || 0)}</span>
+              </div>
+              <div className="text-center">
+                <span className="text-[10px] text-amber-700 uppercase block">Slouch</span>
+                <span className="font-bold text-amber-700">{formatMinSec(currentSession.slouchPostureTime || 0)}</span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* AI Study Coach Insights */}
         <div className="p-4 sm:p-5 rounded-xl bg-indigo-50/70 border border-indigo-100 space-y-3">
@@ -201,7 +257,7 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
             </div>
           ) : (
             <p className="text-xs text-slate-600">
-              Get personalized AI analysis on your attention stamina, distraction patterns, and ergonomic tips based strictly on this session's collected metrics.
+              Get personalized AI analysis on your attention stamina, upper body posture, distraction patterns, and ergonomic tips based strictly on this session's collected metrics.
             </p>
           )}
         </div>
@@ -234,28 +290,68 @@ export const SessionSummaryModal: React.FC<SessionSummaryModalProps> = ({
           </div>
         </div>
 
+        {/* Email Delivery Status Banner */}
+        {currentSession.emailedTo && (
+          <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 font-medium">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              Saved log emailed to <strong>{currentSession.emailedTo}</strong>
+            </span>
+            {currentSession.emailedAt && (
+              <span className="font-mono text-[11px] text-emerald-700">
+                {new Date(currentSession.emailedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Action Buttons */}
-        <div className="flex flex-col-reverse sm:flex-row items-center justify-end gap-3 pt-2">
+        <div className="flex flex-col-reverse sm:flex-row items-center justify-between gap-3 pt-2">
           <button
-            id="btn-start-another-session"
-            onClick={() => {
-              handleSave();
-              onStartNewSession();
-            }}
-            className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs sm:text-sm border border-slate-200 transition-colors cursor-pointer"
+            id="btn-send-summary-email"
+            type="button"
+            onClick={handleOpenEmailDialog}
+            className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-semibold text-xs sm:text-sm border border-emerald-200 transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
           >
-            Start Another Session
+            <Mail className="w-4 h-4 text-emerald-600" />
+            <span>{currentSession.emailedTo ? 'Resend Log via Gmail' : 'Send Log via Gmail'}</span>
           </button>
-          <button
-            id="btn-save-session"
-            onClick={handleSave}
-            className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs sm:text-sm shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
-          >
-            <Check className="w-4 h-4" />
-            Save & Return to Dashboard
-          </button>
+
+          <div className="flex flex-col-reverse sm:flex-row items-center gap-2.5 w-full sm:w-auto">
+            <button
+              id="btn-start-another-session"
+              onClick={() => {
+                handleSave();
+                onStartNewSession();
+              }}
+              className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs sm:text-sm border border-slate-200 transition-colors cursor-pointer"
+            >
+              Start Another Session
+            </button>
+            <button
+              id="btn-save-session"
+              onClick={handleSave}
+              className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs sm:text-sm shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Check className="w-4 h-4" />
+              Save & Return to Dashboard
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Explicit Confirmation Modal for Gmail Sending */}
+      {showEmailModal && (
+        <EmailSessionModal
+          session={buildUpdatedSession()}
+          defaultRecipientEmail={userEmail}
+          onClose={() => setShowEmailModal(false)}
+          onEmailSent={(updatedWithMail) => {
+            setCurrentSession(updatedWithMail);
+            onUpdateSession?.(updatedWithMail);
+          }}
+        />
+      )}
     </div>
   );
 };

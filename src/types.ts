@@ -25,6 +25,24 @@ export type FocusState =
   | 'NO_FACE' 
   | 'PAUSED';
 
+export type PostureStatus =
+  | 'UPRIGHT'
+  | 'SLIGHT_SLOUCH'
+  | 'SLOUCHING'
+  | 'UNEVEN_SHOULDERS'
+  | 'UNKNOWN';
+
+export interface UpperBodyPostureMetrics {
+  postureScore: number; // 0 - 100
+  postureStatus: PostureStatus;
+  shoulderTiltDeg: number; // degrees
+  slouchAngleDeg: number; // forward lean / neck slouch angle in degrees
+  neckDropRatio: number; // vertical head-to-shoulder extension normalized by shoulder width
+  forwardLeanPct: number; // % forward lean relative to calibrated baseline
+  shouldersDetected: boolean;
+  postureFeedback: string;
+}
+
 export interface FocusInterval {
   state: 'focused' | 'distracted' | 'away';
   startSecond: number;
@@ -61,6 +79,13 @@ export interface StudySession {
   distractions: DistractionDetail[];
   cameraUnavailableSeconds?: number;
   aiSummary?: string;
+  avgPostureScore?: number;
+  uprightPostureTime?: number;
+  slouchPostureTime?: number;
+  postureSummary?: string;
+  emailedTo?: string;
+  emailedAt?: number;
+  emailMessageId?: string;
 }
 
 export interface CalibrationData {
@@ -72,6 +97,9 @@ export interface CalibrationData {
   baselineFaceX?: number;
   baselineFaceY?: number;
   baselineFaceScale: number;
+  baselineNeckDropRatio?: number;
+  baselineShoulderTilt?: number;
+  baselineShoulderWidth?: number;
   isCalibrated: boolean;
   calibratedAt?: string;
 }
@@ -100,6 +128,9 @@ export interface StudentProfile {
   baselineFaceX: number;
   baselineFaceY: number;
   baselineFaceScale: number;
+  baselineNeckDropRatio?: number;
+  baselineShoulderTilt?: number;
+  baselineShoulderWidth?: number;
   isCalibrated: boolean;
   calibratedAt?: string;
   // Custom detection limits
@@ -125,6 +156,8 @@ export interface AppSettings {
   browserNotifications: boolean;
   dailyGoalMinutes: number;
   simulationMode: boolean;
+  promptEmailOnSessionSave?: boolean;
+  preferredReportEmail?: string;
 }
 
 export interface BoundViolations {
@@ -167,5 +200,6 @@ export interface TrackerMetrics {
   allowedPitchRange: [number, number];
   allowedGazeRange: [number, number];
   lastDistractionReason?: string;
+  posture?: UpperBodyPostureMetrics;
 }
 

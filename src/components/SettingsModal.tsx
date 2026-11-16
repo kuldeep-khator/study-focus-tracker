@@ -1,14 +1,17 @@
 import React, { useState } from 'react';
 import { 
   Settings, ShieldCheck, Trash2, Download, RefreshCw, Volume2, 
-  Eye, Sliders, Bell, CheckCircle2, Lock, Cpu, AlertTriangle 
+  Eye, Sliders, Bell, CheckCircle2, Lock, Cpu, AlertTriangle, Mail 
 } from 'lucide-react';
 import { AppSettings, CalibrationData, StudySession } from '../types';
+import { connectGmailAccount } from '../utils/gmail';
+import { getGmailAccessToken } from '../lib/firebase';
 
 interface SettingsModalProps {
   settings: AppSettings;
   calibration: CalibrationData;
   sessions: StudySession[];
+  userEmail?: string;
   onUpdateSettings: (settings: AppSettings) => void;
   onClearSessions: () => void;
   onClearAllData: () => void;
@@ -20,6 +23,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   calibration,
   sessions,
+  userEmail = '',
   onUpdateSettings,
   onClearSessions,
   onClearAllData,
@@ -28,6 +32,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 }) => {
   const [showRawJson, setShowRawJson] = useState<boolean>(false);
   const [saveToast, setSaveToast] = useState<string | null>(null);
+  const [gmailConnected, setGmailConnected] = useState<boolean>(() => Boolean(getGmailAccessToken()));
 
   const triggerToast = (msg: string) => {
     setSaveToast(msg);
@@ -294,6 +299,127 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               }}
               className="w-5 h-5 accent-indigo-600 rounded cursor-pointer"
             />
+          </div>
+
+          {/* Browser Desktop Notifications (Background Tab / Other Browser Alerts) */}
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-4 md:col-span-2">
+            <div className="space-y-0.5">
+              <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                <Bell className="w-4 h-4 text-indigo-600" />
+                Desktop Alert Messages (Background Tabs &amp; Other Browsers)
+              </span>
+              <p className="text-[11px] text-slate-500">
+                Send OS/browser notification messages when you get distracted while another tab, browser, or application is open.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                id="btn-test-desktop-notification"
+                onClick={async () => {
+                  if (!('Notification' in window)) {
+                    triggerToast('Browser notifications are not supported in this browser');
+                    return;
+                  }
+                  let perm = Notification.permission;
+                  if (perm === 'default') {
+                    perm = await Notification.requestPermission();
+                  }
+                  if (perm === 'granted') {
+                    new Notification('🔔 Study Focus Alert (Test)', {
+                      body: 'Background distraction messages are active! You will see alerts like this when switching tabs or browsers.',
+                    });
+                    triggerToast('Test desktop message sent!');
+                  } else {
+                    triggerToast('Notification permission denied in browser settings');
+                  }
+                }}
+                className="px-2.5 py-1 rounded-lg bg-white hover:bg-slate-100 text-[11px] text-slate-700 border border-slate-300 cursor-pointer shadow-2xs font-medium"
+              >
+                Test Message
+              </button>
+              <input
+                id="toggle-browser-notifications"
+                type="checkbox"
+                checked={settings.browserNotifications}
+                onChange={async e => {
+                  const enabled = e.target.checked;
+                  if (enabled && 'Notification' in window && Notification.permission === 'default') {
+                    await Notification.requestPermission();
+                  }
+                  onUpdateSettings({ ...settings, browserNotifications: enabled });
+                  triggerToast(enabled ? 'Desktop alert messages enabled' : 'Desktop alert messages disabled');
+                }}
+                className="w-5 h-5 accent-indigo-600 rounded cursor-pointer"
+              />
+            </div>
+          </div>
+
+          {/* Gmail Email Logging Preferences */}
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3 md:col-span-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                  <Mail className="w-4 h-4 text-indigo-600" />
+                  Gmail Study Log Reporting
+                </span>
+                <p className="text-[11px] text-slate-500">
+                  Send saved study session statistics, distraction logs, and upper body posture metrics via your Gmail account.
+                </p>
+              </div>
+              <button
+                id="btn-connect-gmail-settings"
+                type="button"
+                onClick={async () => {
+                  try {
+                    await connectGmailAccount();
+                    setGmailConnected(true);
+                    triggerToast('Gmail send permission authorized!');
+                  } catch (err: any) {
+                    triggerToast(err?.message || 'Could not authorize Gmail');
+                  }
+                }}
+                className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors cursor-pointer shrink-0 ${
+                  gmailConnected
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-300'
+                }`}
+              >
+                {gmailConnected ? '✓ Gmail Connected' : 'Connect Gmail Account'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-slate-200/80">
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                  Default Recipient Email
+                </label>
+                <input
+                  id="input-preferred-report-email"
+                  type="email"
+                  value={settings.preferredReportEmail ?? ''}
+                  placeholder={userEmail || 'student@example.com'}
+                  onChange={e => onUpdateSettings({ ...settings, preferredReportEmail: e.target.value })}
+                  className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 bg-white text-slate-900 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3 bg-white p-2.5 rounded-lg border border-slate-200">
+                <div>
+                  <span className="text-[11px] font-semibold text-slate-800 block">
+                    Open Email Prompt After Session
+                  </span>
+                  <span className="text-[10px] text-slate-500">
+                    Ask to confirm &amp; send email when completing a session
+                  </span>
+                </div>
+                <input
+                  id="toggle-prompt-email-on-save"
+                  type="checkbox"
+                  checked={Boolean(settings.promptEmailOnSessionSave)}
+                  onChange={e => onUpdateSettings({ ...settings, promptEmailOnSessionSave: e.target.checked })}
+                  className="w-4 h-4 accent-indigo-600 rounded cursor-pointer"
+                />
+              </div>
+            </div>
           </div>
         </div>
       </div>

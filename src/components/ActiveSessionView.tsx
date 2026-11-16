@@ -16,6 +16,8 @@ import {
   clearActiveSessionState, 
   ActiveSessionStorageData 
 } from '../utils/sessionManager';
+import { createBackgroundInterval } from '../utils/backgroundTimer';
+import { unlockAudioContext } from '../utils/audio';
 
 interface ActiveSessionViewProps {
   settings: AppSettings;
@@ -30,6 +32,7 @@ interface ActiveSessionViewProps {
   onStartCalibration: () => void;
   onCancelCalibration: () => void;
   onMetricsUpdate?: (metrics: TrackerMetrics) => void;
+  onToggleSimulation?: () => void;
   userId: string;
 }
 
@@ -59,6 +62,7 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
   onStartCalibration,
   onCancelCalibration,
   onMetricsUpdate,
+  onToggleSimulation,
   userId,
 }) => {
   // Session Lifecycle State Machine
@@ -134,8 +138,55 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     type: 'distraction' | 'encouragement' | 'info' 
   } | null>(null);
 
+  // Desktop Notification permission status
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission | 'unsupported'>(() => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return 'unsupported';
+    return Notification.permission;
+  });
+
   const isActive = lifecycleState === 'ACTIVE' || lifecycleState === 'PAUSED' || lifecycleState === 'CAMERA_UNAVAILABLE';
   const isPaused = lifecycleState === 'PAUSED';
+
+  // Refs synced with latest state so background Web Worker tick never tears down/restarts every second
+  const metricsRef = useRef<TrackerMetrics>(metrics);
+  metricsRef.current = metrics;
+  const isCameraUnavailableRef = useRef<boolean>(isCameraUnavailable);
+  isCameraUnavailableRef.current = isCameraUnavailable;
+  const focusedSecondsRef = useRef<number>(focusedSeconds);
+  focusedSecondsRef.current = focusedSeconds;
+  const distractionSecondsRef = useRef<number>(distractionSeconds);
+  distractionSecondsRef.current = distractionSeconds;
+  const distractionCountRef = useRef<number>(distractionCount);
+  distractionCountRef.current = distractionCount;
+  const longestStreakRef = useRef<number>(longestStreak);
+  longestStreakRef.current = longestStreak;
+  const currentStreakRef = useRef<number>(currentStreak);
+  currentStreakRef.current = currentStreak;
+  const intervalsRef = useRef<FocusInterval[]>(intervals);
+  intervalsRef.current = intervals;
+  const distractionLogRef = useRef<DistractionDetail[]>(distractionLog);
+  distractionLogRef.current = distractionLog;
+  const cameraUnavailableSecondsRef = useRef<number>(cameraUnavailableSeconds);
+  cameraUnavailableSecondsRef.current = cameraUnavailableSeconds;
+  const subjectRef = useRef<string>(subject);
+  subjectRef.current = subject;
+  const customSubjectTextRef = useRef<string>(customSubjectText);
+  customSubjectTextRef.current = customSubjectText;
+  const isCustomSubjectRef = useRef<boolean>(isCustomSubject);
+  isCustomSubjectRef.current = isCustomSubject;
+  const activeProfileRef = useRef<StudentProfile>(activeProfile);
+  activeProfileRef.current = activeProfile;
+  const sessionNotesRef = useRef<string>(sessionNotes);
+  sessionNotesRef.current = sessionNotes;
+  const elapsedSecondsRef = useRef<number>(elapsedSeconds);
+  elapsedSecondsRef.current = elapsedSeconds;
+  const titleFlashRef = useRef<boolean>(false);
+
+  // Upper body posture session accumulation refs
+  const postureScoreSumRef = useRef<number>(0);
+  const postureSampleCountRef = useRef<number>(0);
+  const uprightPostureSecondsRef = useRef<number>(0);
+  const slouchPostureSecondsRef = useRef<number>(0);
 
   // Check for interrupted active session on initial mount
   useEffect(() => {
@@ -167,17 +218,43 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     const previousUnavailable = interruptedSession.cameraUnavailableSeconds || 0;
     setCameraUnavailableSeconds(previousUnavailable + gapSeconds);
 
+    const recoveredFocused = interruptedSession.focusedSeconds || 0;
+    const recoveredDistracted = interruptedSession.distractionSeconds || 0;
+    const recoveredCount = interruptedSession.distractionCount || 0;
+    const recoveredLongest = interruptedSession.longestStreak || 0;
+    const recoveredStreak = interruptedSession.currentStreak || 0;
+    const recoveredIntervals = interruptedSession.intervals || [];
+    const recoveredDistractions = interruptedSession.distractions || [];
+    const recoveredUnavailable = previousUnavailable + gapSeconds;
+    const recoveredElapsed = recoveredFocused + recoveredDistracted + recoveredUnavailable;
+
     setSubject(interruptedSession.subject || 'Computer Science & Coding');
-    setElapsedSeconds(interruptedSession.focusedSeconds + interruptedSession.distractionSeconds + previousUnavailable + gapSeconds);
-    setFocusedSeconds(interruptedSession.focusedSeconds || 0);
-    setDistractionSeconds(interruptedSession.distractionSeconds || 0);
-    setDistractionCount(interruptedSession.distractionCount || 0);
-    setLongestStreak(interruptedSession.longestStreak || 0);
-    setCurrentStreak(interruptedSession.currentStreak || 0);
-    setIntervals(interruptedSession.intervals || []);
-    setDistractionLog(interruptedSession.distractions || []);
+    setElapsedSeconds(recoveredElapsed);
+    setFocusedSeconds(recoveredFocused);
+    setDistractionSeconds(recoveredDistracted);
+    setDistractionCount(recoveredCount);
+    setLongestStreak(recoveredLongest);
+    setCurrentStreak(recoveredStreak);
+    setIntervals(recoveredIntervals);
+    setDistractionLog(recoveredDistractions);
     setSessionNotes(interruptedSession.notes || '');
 
+    elapsedSecondsRef.current = recoveredElapsed;
+    focusedSecondsRef.current = recoveredFocused;
+    distractionSecondsRef.current = recoveredDistracted;
+    distractionCountRef.current = recoveredCount;
+    longestStreakRef.current = recoveredLongest;
+    currentStreakRef.current = recoveredStreak;
+    intervalsRef.current = recoveredIntervals;
+    distractionLogRef.current = recoveredDistractions;
+    cameraUnavailableSecondsRef.current = recoveredUnavailable;
+    postureScoreSumRef.current = interruptedSession.postureScoreSum || 0;
+    postureSampleCountRef.current = interruptedSession.postureSampleCount || 0;
+    uprightPostureSecondsRef.current = interruptedSession.uprightPostureSeconds || 0;
+    slouchPostureSecondsRef.current = interruptedSession.slouchPostureSeconds || 0;
+    lastTickTimeRef.current = Date.now();
+
+    unlockAudioContext();
     setLifecycleState('ACTIVE');
     setInterruptedSession(null);
   };
@@ -208,23 +285,86 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     return Math.min(100, Math.max(0, Math.round((focusedSeconds / active) * 100)));
   }, [focusedSeconds, distractionSeconds]);
 
+  // Request browser notification permission helper
+  const requestBrowserNotificationPermission = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    try {
+      const perm = await Notification.requestPermission();
+      setNotifPermission(perm);
+    } catch {
+      // ignore permission errors
+    }
+  };
+
+  // Send native browser/OS notification message (visible even when another tab or browser is open)
+  const sendDesktopAlertMessage = (title: string, body: string) => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    if (!settings.browserNotifications && !document.hidden) return;
+    if (Notification.permission === 'granted') {
+      try {
+        const n = new Notification(title, {
+          body,
+          tag: `study-focus-alert-${Date.now()}`,
+          requireInteraction: false,
+        });
+        n.onclick = () => {
+          try {
+            window.focus();
+            n.close();
+          } catch {
+            // ignore
+          }
+        };
+      } catch (e) {
+        console.debug('Notification trigger caught:', e);
+      }
+    }
+  };
+
   // Request browser notification permissions on mount if enabled
   useEffect(() => {
     if (settings.browserNotifications && 'Notification' in window) {
+      setNotifPermission(Notification.permission);
       if (Notification.permission === 'default') {
-        Notification.requestPermission();
+        Notification.requestPermission().then(setNotifPermission).catch(() => {});
       }
     }
   }, [settings.browserNotifications]);
 
+  // Restore document.title on unmount or when session is IDLE
+  useEffect(() => {
+    const defaultTitle = 'Study Focus Tracker | AI Computer-Vision Focus Monitor';
+    if (lifecycleState === 'IDLE' || lifecycleState === 'ENDED') {
+      document.title = defaultTitle;
+    }
+    return () => {
+      document.title = defaultTitle;
+    };
+  }, [lifecycleState]);
+
   // Handle Metrics Update from CameraTracker
   const handleMetricsUpdate = (newMetrics: TrackerMetrics) => {
+    metricsRef.current = newMetrics;
     setMetrics(newMetrics);
     onMetricsUpdate?.(newMetrics);
   };
 
   // 1-Click Pose Snapshot Baseline handler
   const handleQuickSnapshotBaseline = () => {
+    if (!metrics.faceDetected) {
+      onStartCalibration();
+      setNotification({
+        message: 'Starting 5-second live pose calibration...',
+        subMessage: 'Camera is activating so we can lock your real head, eye & shoulder posture.',
+        visible: true,
+        type: 'info',
+      });
+      setTimeout(() => {
+        setNotification(prev => (prev?.type === 'info' ? { ...prev, visible: false } : prev));
+      }, 4000);
+      return;
+    }
+
     onCalibrationComplete({
       baselineYaw: metrics.rawYaw,
       baselinePitch: metrics.rawPitch,
@@ -232,6 +372,8 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       baselineGazeX: metrics.rawGazeX,
       baselineGazeY: metrics.rawGazeY,
       baselineFaceScale: 1.0,
+      baselineNeckDropRatio: metrics.posture?.neckDropRatio,
+      baselineShoulderTilt: metrics.posture?.shoulderTiltDeg,
       isCalibrated: true,
       calibratedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     });
@@ -248,6 +390,11 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
 
   // Start Study Session Handler
   const handleStartSession = () => {
+    unlockAudioContext();
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().then(setNotifPermission).catch(() => {});
+    }
+
     sessionIdRef.current = `session-${Date.now()}`;
     sessionStartTimestampRef.current = Date.now();
     totalPausedMsRef.current = 0;
@@ -263,16 +410,32 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     setDistractionLog([]);
     setCameraUnavailableSeconds(0);
     activeDistractionRef.current = null;
+
+    elapsedSecondsRef.current = 0;
+    focusedSecondsRef.current = 0;
+    distractionSecondsRef.current = 0;
+    distractionCountRef.current = 0;
+    currentStreakRef.current = 0;
+    longestStreakRef.current = 0;
+    intervalsRef.current = [];
+    distractionLogRef.current = [];
+    cameraUnavailableSecondsRef.current = 0;
+    postureScoreSumRef.current = 0;
+    postureSampleCountRef.current = 0;
+    uprightPostureSecondsRef.current = 0;
+    slouchPostureSecondsRef.current = 0;
   };
 
   // Pause Study Session Handler
   const handlePauseSession = () => {
     pauseStartTimestampRef.current = Date.now();
     setLifecycleState('PAUSED');
+    document.title = '⏸️ Session Paused — StudyFocus AI';
   };
 
   // Resume Study Session Handler
   const handleResumeSession = () => {
+    unlockAudioContext();
     if (pauseStartTimestampRef.current > 0) {
       totalPausedMsRef.current += (Date.now() - pauseStartTimestampRef.current);
       pauseStartTimestampRef.current = 0;
@@ -288,15 +451,33 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
 
     const totalDuration = Math.max(
       Math.floor((sessionEndTimestampRef.current - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000),
-      elapsedSeconds,
+      elapsedSecondsRef.current,
       1
     );
 
-    const calculatedFocused = Math.max(totalDuration - distractionSeconds - cameraUnavailableSeconds, 0);
-    const denominator = calculatedFocused + distractionSeconds;
+    const finalDistracted = distractionSecondsRef.current;
+    const finalUnavailable = cameraUnavailableSecondsRef.current;
+    const calculatedFocused = Math.max(totalDuration - finalDistracted - finalUnavailable, 0);
+    const denominator = calculatedFocused + finalDistracted;
     const finalScore = denominator > 0 ? Math.min(100, Math.max(0, Math.round((calculatedFocused / denominator) * 100))) : 100;
 
     const chosenSubject = isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject;
+
+    const postureSamples = postureSampleCountRef.current;
+    const avgPostureScore =
+      postureSamples > 0
+        ? Math.min(100, Math.max(0, Math.round(postureScoreSumRef.current / postureSamples)))
+        : metricsRef.current.posture?.postureScore;
+    const uprightTime = uprightPostureSecondsRef.current;
+    const slouchTime = slouchPostureSecondsRef.current;
+    const postureSummary =
+      typeof avgPostureScore === 'number'
+        ? avgPostureScore >= 85
+          ? 'Excellent upright upper-body alignment throughout study.'
+          : avgPostureScore >= 70
+          ? 'Mostly upright posture with occasional forward neck or shoulder slouch.'
+          : 'Frequent slouching or shoulder tilt detected — consider raising your screen height.'
+        : undefined;
 
     const finalSession: StudySession = {
       id: sessionIdRef.current || `session-${Date.now()}`,
@@ -307,15 +488,19 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       endTime: sessionEndTimestampRef.current,
       duration: totalDuration,
       focusedTime: calculatedFocused,
-      distractionTime: distractionSeconds,
-      distractionCount,
+      distractionTime: finalDistracted,
+      distractionCount: distractionCountRef.current,
       focusScore: finalScore,
-      longestStreak: Math.max(longestStreak, currentStreak),
+      longestStreak: Math.max(longestStreakRef.current, currentStreakRef.current),
       subject: chosenSubject,
       notes: sessionNotes.trim() || undefined,
-      intervals: intervals.length > 0 ? intervals : [{ state: 'focused', startSecond: 0, endSecond: totalDuration }],
-      distractions: distractionLog,
-      cameraUnavailableSeconds: cameraUnavailableSeconds > 0 ? cameraUnavailableSeconds : undefined,
+      intervals: intervalsRef.current.length > 0 ? intervalsRef.current : [{ state: 'focused', startSecond: 0, endSecond: totalDuration }],
+      distractions: distractionLogRef.current,
+      cameraUnavailableSeconds: finalUnavailable > 0 ? finalUnavailable : undefined,
+      avgPostureScore,
+      uprightPostureTime: uprightTime,
+      slouchPostureTime: slouchTime,
+      postureSummary,
     };
 
     if (userId) {
@@ -327,87 +512,150 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     setLifecycleState('IDLE');
   };
 
-  // Periodic Local Storage Sync & True Timestamp-based Background Clock
+  // Periodic Local Storage Sync & Unthrottled Web Worker Background Clock
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (lifecycleState === 'ACTIVE') {
-      interval = setInterval(() => {
-        const now = Date.now();
-        const deltaSeconds = Math.max(1, Math.round((now - lastTickTimeRef.current) / 1000));
-        lastTickTimeRef.current = now;
+    if (lifecycleState !== 'ACTIVE') return;
 
-        // Calculate true wall-clock elapsed time
-        const currentElapsed = Math.max(
-          0,
-          Math.floor((now - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000)
-        );
-        setElapsedSeconds(currentElapsed);
+    lastTickTimeRef.current = Date.now();
 
-        // Update focused vs distraction time based on current status
-        if (isCameraUnavailable) {
-          setCameraUnavailableSeconds(prev => prev + deltaSeconds);
-        } else if (metrics.state === 'FOCUSED') {
-          setFocusedSeconds(prev => prev + deltaSeconds);
-          setCurrentStreak(prev => {
-            const next = prev + deltaSeconds;
-            setLongestStreak(longest => Math.max(longest, next));
-            return next;
-          });
-        } else if (metrics.state === 'DISTRACTED') {
-          setDistractionSeconds(prev => prev + deltaSeconds);
-          setCurrentStreak(0);
-        } else if (metrics.state === 'DRIFTING' || metrics.state === 'NO_FACE') {
-          // Drifting under threshold counts as study time before distraction triggers
-          setFocusedSeconds(prev => prev + deltaSeconds);
+    const stopWorkerClock = createBackgroundInterval(() => {
+      const now = Date.now();
+      const deltaSeconds = Math.max(1, Math.round((now - lastTickTimeRef.current) / 1000));
+      lastTickTimeRef.current = now;
+
+      // Calculate true wall-clock elapsed time
+      const currentElapsed = Math.max(
+        0,
+        Math.floor((now - sessionStartTimestampRef.current - totalPausedMsRef.current) / 1000)
+      );
+      elapsedSecondsRef.current = currentElapsed;
+      setElapsedSeconds(currentElapsed);
+
+      const liveState = metricsRef.current.state;
+      const camUnavailable = isCameraUnavailableRef.current;
+
+      // Update focused vs distraction time based on current real-time CV status
+      if (camUnavailable) {
+        const nextUnavail = cameraUnavailableSecondsRef.current + deltaSeconds;
+        cameraUnavailableSecondsRef.current = nextUnavail;
+        setCameraUnavailableSeconds(nextUnavail);
+      } else if (liveState === 'DISTRACTED') {
+        const nextDistracted = distractionSecondsRef.current + deltaSeconds;
+        distractionSecondsRef.current = nextDistracted;
+        setDistractionSeconds(nextDistracted);
+        currentStreakRef.current = 0;
+        setCurrentStreak(0);
+      } else {
+        // FOCUSED, or brief <threshold DRIFTING / NO_FACE grace period
+        const nextFocused = focusedSecondsRef.current + deltaSeconds;
+        focusedSecondsRef.current = nextFocused;
+        setFocusedSeconds(nextFocused);
+
+        if (liveState === 'FOCUSED') {
+          const nextStreak = currentStreakRef.current + deltaSeconds;
+          currentStreakRef.current = nextStreak;
+          setCurrentStreak(nextStreak);
+          if (nextStreak > longestStreakRef.current) {
+            longestStreakRef.current = nextStreak;
+            setLongestStreak(nextStreak);
+          }
         }
+      }
 
-        // Maintain live focus intervals (chunks of 5-10s)
-        setIntervals(prev => {
-          const currentState = isCameraUnavailable ? 'away' : metrics.state === 'DISTRACTED' ? 'distracted' : metrics.state === 'NO_FACE' ? 'away' : 'focused';
-          if (prev.length === 0) {
-            return [{ state: currentState, startSecond: 0, endSecond: deltaSeconds }];
-          }
-          const last = prev[prev.length - 1];
-          if (last.state === currentState) {
-            return [...prev.slice(0, -1), { ...last, endSecond: last.endSecond + deltaSeconds }];
-          } else {
-            return [...prev, { state: currentState, startSecond: last.endSecond, endSecond: last.endSecond + deltaSeconds }];
-          }
+      // Accumulate upper body posture score & upright vs slouch duration
+      const livePosture = metricsRef.current.posture;
+      if (!camUnavailable && livePosture && livePosture.postureStatus !== 'UNKNOWN') {
+        postureScoreSumRef.current += livePosture.postureScore * deltaSeconds;
+        postureSampleCountRef.current += deltaSeconds;
+        if (livePosture.postureStatus === 'UPRIGHT') {
+          uprightPostureSecondsRef.current += deltaSeconds;
+        } else {
+          slouchPostureSecondsRef.current += deltaSeconds;
+        }
+      }
+
+      // Update browser tab title so user sees distraction alerts even from another tab
+      if (camUnavailable) {
+        document.title = `⚠️ Camera Unavailable — StudyFocus AI`;
+      } else if (liveState === 'DISTRACTED') {
+        titleFlashRef.current = !titleFlashRef.current;
+        document.title = titleFlashRef.current
+          ? '🚨 DISTRACTED! Return to Study — StudyFocus AI'
+          : '💬 Focus Alert: Please return to screen!';
+      } else if (liveState === 'DRIFTING' || liveState === 'NO_FACE') {
+        document.title = `🟡 Drifting (${formatTime(currentElapsed)}) — StudyFocus AI`;
+      } else {
+        document.title = `🟢 Studying (${formatTime(currentElapsed)}) — StudyFocus AI`;
+      }
+
+      // Maintain live focus intervals
+      const intervalState: FocusInterval['state'] = camUnavailable
+        ? 'away'
+        : liveState === 'DISTRACTED'
+        ? 'distracted'
+        : liveState === 'NO_FACE'
+        ? 'away'
+        : 'focused';
+
+      const prevIntervals = intervalsRef.current;
+      let nextIntervals: FocusInterval[];
+      if (prevIntervals.length === 0) {
+        nextIntervals = [{ state: intervalState, startSecond: 0, endSecond: deltaSeconds }];
+      } else {
+        const last = prevIntervals[prevIntervals.length - 1];
+        if (last.state === intervalState) {
+          nextIntervals = [...prevIntervals.slice(0, -1), { ...last, endSecond: last.endSecond + deltaSeconds }];
+        } else {
+          nextIntervals = [...prevIntervals, { state: intervalState, startSecond: last.endSecond, endSecond: last.endSecond + deltaSeconds }];
+        }
+      }
+      intervalsRef.current = nextIntervals;
+      setIntervals(nextIntervals);
+
+      // Persist live session state to localStorage
+      if (userId) {
+        const currentSubj = isCustomSubjectRef.current && customSubjectTextRef.current.trim()
+          ? customSubjectTextRef.current.trim()
+          : subjectRef.current;
+
+        saveActiveSessionState({
+          userId,
+          sessionId: sessionIdRef.current,
+          lifecycleState: 'ACTIVE',
+          subject: currentSubj,
+          studentId: activeProfileRef.current.id,
+          studentName: activeProfileRef.current.name,
+          sessionStartTimestamp: sessionStartTimestampRef.current,
+          pauseStartTimestamp: pauseStartTimestampRef.current,
+          totalPausedMs: totalPausedMsRef.current,
+          lastHeartbeatTimestamp: now,
+          focusedSeconds: focusedSecondsRef.current,
+          distractionSeconds: distractionSecondsRef.current,
+          distractionCount: distractionCountRef.current,
+          longestStreak: longestStreakRef.current,
+          currentStreak: currentStreakRef.current,
+          intervals: nextIntervals,
+          distractions: distractionLogRef.current,
+          notes: sessionNotesRef.current,
+          cameraUnavailableSeconds: cameraUnavailableSecondsRef.current,
+          lastCameraAvailabilityCheck: now,
+          postureScoreSum: postureScoreSumRef.current,
+          postureSampleCount: postureSampleCountRef.current,
+          uprightPostureSeconds: uprightPostureSecondsRef.current,
+          slouchPostureSeconds: slouchPostureSecondsRef.current,
         });
+      }
+    }, 1000);
 
-        // Persist live session state to localStorage
-        if (userId) {
-          saveActiveSessionState({
-            userId,
-            sessionId: sessionIdRef.current,
-            lifecycleState: 'ACTIVE',
-            subject: isCustomSubject && customSubjectText.trim() ? customSubjectText.trim() : subject,
-            studentId: activeProfile.id,
-            studentName: activeProfile.name,
-            sessionStartTimestamp: sessionStartTimestampRef.current,
-            pauseStartTimestamp: pauseStartTimestampRef.current,
-            totalPausedMs: totalPausedMsRef.current,
-            lastHeartbeatTimestamp: now,
-            focusedSeconds,
-            distractionSeconds,
-            distractionCount,
-            longestStreak,
-            currentStreak,
-            intervals,
-            distractions: distractionLog,
-            notes: sessionNotes,
-            cameraUnavailableSeconds,
-            lastCameraAvailabilityCheck: now,
-          });
-        }
-      }, 1000);
-    }
-    return () => clearInterval(interval);
-  }, [lifecycleState, metrics.state, isCameraUnavailable, userId, subject, isCustomSubject, customSubjectText, activeProfile, focusedSeconds, distractionSeconds, distractionCount, longestStreak, currentStreak, intervals, distractionLog, sessionNotes, cameraUnavailableSeconds]);
+    return () => stopWorkerClock();
+  }, [lifecycleState, userId]);
 
   // Distraction Event Started (Fires strictly once when sustained threshold is crossed)
   const handleDistractionEventStart = ({ startTimestamp, reason }: { startTimestamp: number; reason: string }) => {
-    setDistractionCount(prev => prev + 1);
+    const nextCount = distractionCountRef.current + 1;
+    distractionCountRef.current = nextCount;
+    setDistractionCount(nextCount);
+
     activeDistractionRef.current = {
       id: `d-${Date.now()}`,
       startTimestamp,
@@ -419,23 +667,39 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       onPlaySound('distraction');
     }
 
-    // Trigger Native Browser Notification if backgrounded / permitted
-    if (settings.browserNotifications && 'Notification' in window && Notification.permission === 'granted') {
-      try {
-        new Notification('🔔 Study Focus Alert', {
-          body: `${activeProfile.name}, you appear to be distracted. Let's get back to studying!`,
-          icon: '/favicon.ico',
-          tag: 'study-focus-distraction',
-        });
-      } catch (e) {
-        console.debug('Notification trigger caught:', e);
-      }
-    }
+    // Trigger Native Browser Desktop Notification (works when another tab or another browser is open)
+    sendDesktopAlertMessage(
+      '🔔 Study Focus Alert — Distraction Detected!',
+      `${activeProfileRef.current.name}: ${reason}. Please return your focus to your study screen!`
+    );
 
     // Show automatic non-intrusive notification toast
     setNotification({
       message: 'You appear to be looking away. Please return your focus to your study.',
       subMessage: reason || 'Sustained distraction boundary violation',
+      visible: true,
+      type: 'distraction',
+    });
+
+    setTimeout(() => {
+      setNotification(prev => (prev?.type === 'distraction' ? { ...prev, visible: false } : prev));
+    }, 6000);
+  };
+
+  // Repeated Distraction Reminder (Fires every notificationCooldown seconds if still distracted)
+  const handleDistractionReminder = ({ durationSeconds, reason }: { durationSeconds: number; reason: string }) => {
+    if (settings.audioAlerts) {
+      onPlaySound('distraction');
+    }
+
+    sendDesktopAlertMessage(
+      `⚠️ Still Distracted (${durationSeconds}s) — StudyFocus AI`,
+      `${activeProfileRef.current.name}, you've been distracted for ${durationSeconds}s (${reason}). Come back to your study session!`
+    );
+
+    setNotification({
+      message: `Still distracted (${durationSeconds}s) — Let's get back to studying!`,
+      subMessage: reason,
       visible: true,
       type: 'distraction',
     });
@@ -457,15 +721,15 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
     durationSeconds: number;
     reason: string;
   }) => {
-    const reasonType: DistractionDetail['reason'] = reason.includes('head')
+    const reasonType: DistractionDetail['reason'] = reason.toLowerCase().includes('head') || reason.toLowerCase().includes('looking up') || reason.toLowerCase().includes('looking down')
       ? 'head_turned'
-      : reason.includes('eye') || reason.includes('gaze')
+      : reason.toLowerCase().includes('eye') || reason.toLowerCase().includes('gaze')
       ? 'gaze_away'
       : 'face_missing';
 
     const newDistraction: DistractionDetail = {
       id: activeDistractionRef.current?.id || `d-${Date.now()}`,
-      secondInSession: elapsedSeconds,
+      secondInSession: elapsedSecondsRef.current,
       startTimestamp,
       endTimestamp,
       timestamp: startTimestamp,
@@ -474,7 +738,9 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       durationSeconds,
     };
 
-    setDistractionLog(prev => [...prev, newDistraction]);
+    const nextLog = [...distractionLogRef.current, newDistraction];
+    distractionLogRef.current = nextLog;
+    setDistractionLog(nextLog);
     activeDistractionRef.current = null;
   };
 
@@ -482,6 +748,13 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
   const handleFocusRestored = () => {
     if (settings.audioAlerts) {
       onPlaySound('restored');
+    }
+
+    if (document.hidden) {
+      sendDesktopAlertMessage(
+        '✅ Focus Restored — StudyFocus AI',
+        `${activeProfileRef.current.name}, great job! You're back inside your study focus zone.`
+      );
     }
 
     setNotification({
@@ -549,18 +822,28 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
       {/* BACKGROUND PERSISTENT SESSION ACTIVE INDICATOR BANNER */}
       {isActive && (
         <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-900 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 flex-wrap">
             <span className="relative flex h-3 w-3">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
             </span>
             <span className="font-bold text-emerald-950">
-              🟢 Persistent Background Study Session Active
+              Persistent Background Study Session Active
             </span>
             <span className="text-emerald-700 hidden sm:inline">&bull;</span>
             <span className="text-emerald-800 font-medium hidden sm:inline">
-              Switching tabs, windows, or minimizing does NOT stop this session.
+              Background webcam &amp; distraction alerts stay active across tabs and windows.
             </span>
+            {notifPermission !== 'granted' && notifPermission !== 'unsupported' && (
+              <button
+                id="btn-enable-desktop-alerts"
+                onClick={requestBrowserNotificationPermission}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold transition-colors cursor-pointer shadow-2xs"
+              >
+                <Bell className="w-3 h-3" />
+                Enable Desktop Alert Messages
+              </button>
+            )}
           </div>
           <div className="flex items-center gap-4 font-mono font-bold text-emerald-950">
             <span>Study Time: {formatTime(elapsedSeconds)}</span>
@@ -736,118 +1019,236 @@ export const ActiveSessionView: React.FC<ActiveSessionViewProps> = ({
             onMetricsUpdate={handleMetricsUpdate}
             onDistractionEventStart={handleDistractionEventStart}
             onDistractionEventEnd={handleDistractionEventEnd}
+            onDistractionReminder={handleDistractionReminder}
             onFocusRestored={handleFocusRestored}
             onCameraUnavailable={handleCameraUnavailable}
             isCalibrating={isCalibrating}
             onCancelCalibration={onCancelCalibration}
             onStartSession={handleStartSession}
+            onEnableSimulation={onToggleSimulation}
           />
 
           {/* Real-time Angle & Telemetry Card with Baseline vs Current vs Allowed Comparison */}
-          <div className="p-4 rounded-xl bg-white border border-slate-200 shadow-xs space-y-3.5 text-xs">
-            <div className="flex items-center justify-between text-slate-600">
-              <span className="font-semibold text-slate-800 flex items-center gap-1.5">
-                <Compass className="w-3.5 h-3.5 text-indigo-600" />
-                Live Pose vs Baseline ({activeProfile.name})
-              </span>
-              <span className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded ${
-                metrics.isWithinBounds ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'
-              }`}>
-                {metrics.isWithinBounds ? 'SAFE ZONE' : 'OUTSIDE BOUNDARY'}
-              </span>
-            </div>
+          {(() => {
+            const isTrackingLive = (isActive && !isPaused) || isCalibrating || settings.simulationMode;
+            const hasFace = isTrackingLive && metrics.faceDetected;
+            const hasPosture = isTrackingLive && Boolean(metrics.posture && metrics.posture.postureStatus !== 'UNKNOWN');
 
-            {/* Quick Calibration Bar */}
-            <div className="flex items-center justify-between p-2 rounded-lg bg-indigo-50/70 border border-indigo-100">
-              <div className="text-[11px] text-slate-600">
-                <span>Baseline Status: </span>
-                <strong className="text-indigo-900 font-semibold">
-                  {activeProfile.isCalibrated 
-                    ? `Locked at ${activeProfile.calibratedAt || 'Recent'}` 
-                    : 'Factory Center (Not yet tuned)'}
-                </strong>
-              </div>
-              <button
-                id="btn-lock-current-pose"
-                onClick={handleQuickSnapshotBaseline}
-                className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold transition-colors cursor-pointer flex items-center gap-1"
-                title="Lock current head and gaze orientation as student's normal study baseline"
-              >
-                <Crosshair className="w-3 h-3" />
-                <span>1-Click Pose Snapshot</span>
-              </button>
-            </div>
+            return (
+              <>
+                <div className="p-4 rounded-xl bg-white border border-slate-200 shadow-xs space-y-3.5 text-xs">
+                  <div className="flex items-center justify-between text-slate-600">
+                    <span className="font-semibold text-slate-800 flex items-center gap-1.5">
+                      <Compass className="w-3.5 h-3.5 text-indigo-600" />
+                      Live Pose vs Baseline ({activeProfile.name})
+                    </span>
+                    <span className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded ${
+                      !isTrackingLive
+                        ? 'bg-slate-100 text-slate-500'
+                        : !hasFace
+                        ? 'bg-amber-50 text-amber-700'
+                        : metrics.isWithinBounds
+                        ? 'bg-emerald-50 text-emerald-700'
+                        : 'bg-red-50 text-red-700'
+                    }`}>
+                      {!isTrackingLive
+                        ? 'STANDBY'
+                        : !hasFace
+                        ? 'SCANNING FACE'
+                        : metrics.isWithinBounds
+                        ? 'SAFE ZONE'
+                        : 'OUTSIDE BOUNDARY'}
+                    </span>
+                  </div>
 
-            {/* 3-Column Angular HUD Comparison Grid */}
-            <div className="grid grid-cols-3 gap-2.5 font-mono text-[11px]">
-              
-              {/* Yaw Comparison Block */}
-              <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
-                <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
-                  <span>Head Yaw</span>
-                  <span className="text-slate-400">Limit: ±{activeProfile.yawLimit || 20}°</span>
-                </div>
-                <div className="text-slate-900 font-bold">
-                  Live: {metrics.rawYaw >= 0 ? '+' : ''}{metrics.rawYaw}°
-                </div>
-                <div className="text-[10px] text-slate-500">
-                  Base: {activeProfile.baselineYaw >= 0 ? '+' : ''}{activeProfile.baselineYaw}°
-                </div>
-                <div className={`text-[10px] font-semibold ${
-                  Math.abs(metrics.yaw) > (activeProfile.yawLimit || 20) ? 'text-rose-600' : 'text-emerald-600'
-                }`}>
-                  Diff: {metrics.yaw >= 0 ? '+' : ''}{metrics.yaw}°
-                </div>
-              </div>
+                  {/* Quick Calibration Bar */}
+                  <div className="flex items-center justify-between p-2 rounded-lg bg-indigo-50/70 border border-indigo-100">
+                    <div className="text-[11px] text-slate-600">
+                      <span>Baseline Status: </span>
+                      <strong className="text-indigo-900 font-semibold">
+                        {activeProfile.isCalibrated 
+                          ? `Locked at ${activeProfile.calibratedAt || 'Recent'}` 
+                          : 'Factory Center (Not yet tuned)'}
+                      </strong>
+                    </div>
+                    <button
+                      id="btn-lock-current-pose"
+                      onClick={handleQuickSnapshotBaseline}
+                      className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold transition-colors cursor-pointer flex items-center gap-1"
+                      title={hasFace ? "Lock current head and gaze orientation as student's normal study baseline" : 'Activate camera for 5s to calibrate live pose baseline'}
+                    >
+                      <Crosshair className="w-3 h-3" />
+                      <span>{hasFace ? '1-Click Pose Snapshot' : 'Calibrate Live Pose'}</span>
+                    </button>
+                  </div>
 
-              {/* Pitch Comparison Block */}
-              <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
-                <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
-                  <span>Head Pitch</span>
-                  <span className="text-slate-400">Limit: ±{activeProfile.pitchLimit || 15}°</span>
-                </div>
-                <div className="text-slate-900 font-bold">
-                  Live: {metrics.rawPitch >= 0 ? '+' : ''}{metrics.rawPitch}°
-                </div>
-                <div className="text-[10px] text-slate-500">
-                  Base: {activeProfile.baselinePitch >= 0 ? '+' : ''}{activeProfile.baselinePitch}°
-                </div>
-                <div className={`text-[10px] font-semibold ${
-                  Math.abs(metrics.pitch) > (activeProfile.pitchLimit || 15) ? 'text-rose-600' : 'text-emerald-600'
-                }`}>
-                  Diff: {metrics.pitch >= 0 ? '+' : ''}{metrics.pitch}°
-                </div>
-              </div>
+                  {/* 3-Column Angular HUD Comparison Grid */}
+                  <div className="grid grid-cols-3 gap-2.5 font-mono text-[11px]">
+                    
+                    {/* Yaw Comparison Block */}
+                    <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                      <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
+                        <span>Head Yaw</span>
+                        <span className="text-slate-400">Limit: ±{activeProfile.yawLimit || 20}°</span>
+                      </div>
+                      <div className="text-slate-900 font-bold">
+                        Live: {hasFace ? `${metrics.rawYaw >= 0 ? '+' : ''}${metrics.rawYaw}°` : '—'}
+                      </div>
+                      <div className="text-[10px] text-slate-500">
+                        Base: {activeProfile.baselineYaw >= 0 ? '+' : ''}{activeProfile.baselineYaw}°
+                      </div>
+                      <div className={`text-[10px] font-semibold ${
+                        !hasFace
+                          ? 'text-slate-400'
+                          : Math.abs(metrics.yaw) > (activeProfile.yawLimit || 20)
+                          ? 'text-rose-600'
+                          : 'text-emerald-600'
+                      }`}>
+                        Diff: {hasFace ? `${metrics.yaw >= 0 ? '+' : ''}${metrics.yaw}°` : '—'}
+                      </div>
+                    </div>
 
-              {/* Gaze Comparison Block */}
-              <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
-                <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
-                  <span>Eye Gaze</span>
-                  <span className="text-slate-400">Limit: ±{activeProfile.gazeLimit || 20}°</span>
-                </div>
-                <div className="text-slate-900 font-bold">
-                  Live: {metrics.rawGazeX >= 0 ? '+' : ''}{metrics.rawGazeX}°
-                </div>
-                <div className="text-[10px] text-slate-500">
-                  Base: {activeProfile.baselineGazeX >= 0 ? '+' : ''}{activeProfile.baselineGazeX}°
-                </div>
-                <div className={`text-[10px] font-semibold ${
-                  Math.abs(metrics.gazeX) > (activeProfile.gazeLimit || 20) ? 'text-rose-600' : 'text-emerald-600'
-                }`}>
-                  Diff: {metrics.gazeX >= 0 ? '+' : ''}{metrics.gazeX}°
-                </div>
-              </div>
+                    {/* Pitch Comparison Block */}
+                    <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                      <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
+                        <span>Head Pitch</span>
+                        <span className="text-slate-400">Limit: ±{activeProfile.pitchLimit || 15}°</span>
+                      </div>
+                      <div className="text-slate-900 font-bold">
+                        Live: {hasFace ? `${metrics.rawPitch >= 0 ? '+' : ''}${metrics.rawPitch}°` : '—'}
+                      </div>
+                      <div className="text-[10px] text-slate-500">
+                        Base: {activeProfile.baselinePitch >= 0 ? '+' : ''}{activeProfile.baselinePitch}°
+                      </div>
+                      <div className={`text-[10px] font-semibold ${
+                        !hasFace
+                          ? 'text-slate-400'
+                          : Math.abs(metrics.pitch) > (activeProfile.pitchLimit || 15)
+                          ? 'text-rose-600'
+                          : 'text-emerald-600'
+                      }`}>
+                        Diff: {hasFace ? `${metrics.pitch >= 0 ? '+' : ''}${metrics.pitch}°` : '—'}
+                      </div>
+                    </div>
 
-            </div>
+                    {/* Gaze Comparison Block */}
+                    <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+                      <div className="text-[10px] text-slate-500 font-sans font-medium flex justify-between">
+                        <span>Eye Gaze</span>
+                        <span className="text-slate-400">Limit: ±{activeProfile.gazeLimit || 20}°</span>
+                      </div>
+                      <div className="text-slate-900 font-bold">
+                        Live: {hasFace ? `${metrics.rawGazeX >= 0 ? '+' : ''}${metrics.rawGazeX}°` : '—'}
+                      </div>
+                      <div className="text-[10px] text-slate-500">
+                        Base: {activeProfile.baselineGazeX >= 0 ? '+' : ''}{activeProfile.baselineGazeX}°
+                      </div>
+                      <div className={`text-[10px] font-semibold ${
+                        !hasFace
+                          ? 'text-slate-400'
+                          : Math.abs(metrics.gazeX) > (activeProfile.gazeLimit || 20)
+                          ? 'text-rose-600'
+                          : 'text-emerald-600'
+                      }`}>
+                        Diff: {hasFace ? `${metrics.gazeX >= 0 ? '+' : ''}${metrics.gazeX}°` : '—'}
+                      </div>
+                    </div>
 
-            {/* Delay Threshold Info */}
-            <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100">
-              <span>Distraction Delay Window:</span>
-              <span className="font-semibold text-slate-700 font-mono">
-                {activeProfile.distractionDelay || settings.distractionThreshold || 5}s sustained look-away required to trigger alert
-              </span>
-            </div>
-          </div>
+                  </div>
+
+                  {/* Delay Threshold Info */}
+                  <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100">
+                    <span>Distraction Delay Window:</span>
+                    <span className="font-semibold text-slate-700 font-mono">
+                      {activeProfile.distractionDelay || settings.distractionThreshold || 5}s sustained look-away required to trigger alert
+                    </span>
+                  </div>
+                </div>
+
+                {/* Real-time Upper Body Posture Telemetry Card */}
+                <div className="p-4 rounded-xl bg-white border border-slate-200 shadow-xs space-y-3 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-slate-800 flex items-center gap-1.5">
+                      <Activity className="w-3.5 h-3.5 text-emerald-600" />
+                      Upper Body Posture Analysis
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-medium px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+                        {hasPosture
+                          ? metrics.posture?.shouldersDetected
+                            ? 'Shoulders Tracked'
+                            : 'Head/Neck Est.'
+                          : isTrackingLive
+                          ? 'Scanning Pose...'
+                          : 'Camera Standby'}
+                      </span>
+                      <span
+                        className={`font-mono text-[11px] font-bold px-2 py-0.5 rounded ${
+                          !isTrackingLive
+                            ? 'bg-slate-100 text-slate-500'
+                            : !hasPosture
+                            ? 'bg-amber-50 text-amber-700'
+                            : metrics.posture?.postureStatus === 'UPRIGHT'
+                            ? 'bg-emerald-50 text-emerald-700'
+                            : metrics.posture?.postureStatus === 'SLIGHT_SLOUCH'
+                            ? 'bg-amber-50 text-amber-700'
+                            : 'bg-rose-50 text-rose-700'
+                        }`}
+                      >
+                        {!isTrackingLive
+                          ? 'STANDBY'
+                          : !hasPosture
+                          ? 'DETECTING...'
+                          : `${metrics.posture!.postureStatus.replace('_', ' ')} (${metrics.posture!.postureScore}%)`}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2.5 font-mono text-[11px]">
+                    <div className="p-2 rounded-lg bg-slate-50 border border-slate-200">
+                      <span className="text-[10px] text-slate-500 font-sans block">Shoulder Tilt</span>
+                      <span className="text-slate-900 font-bold">
+                        {hasPosture && metrics.posture
+                          ? `${metrics.posture.shoulderTiltDeg >= 0 ? '+' : ''}${metrics.posture.shoulderTiltDeg}°`
+                          : '—'}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-lg bg-slate-50 border border-slate-200">
+                      <span className="text-[10px] text-slate-500 font-sans block">Slouch Angle</span>
+                      <span className="text-slate-900 font-bold">
+                        {hasPosture && metrics.posture ? `${metrics.posture.slouchAngleDeg}°` : '—'}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-lg bg-slate-50 border border-slate-200">
+                      <span className="text-[10px] text-slate-500 font-sans block">Forward Lean</span>
+                      <span className="text-slate-900 font-bold">
+                        {hasPosture && metrics.posture ? `${metrics.posture.forwardLeanPct}%` : '—'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">
+                    <span>
+                      {!isTrackingLive
+                        ? 'Start a study session or turn on Simulation Mode to track live head pose & upper-body posture.'
+                        : hasPosture && metrics.posture?.postureFeedback
+                        ? metrics.posture.postureFeedback
+                        : 'Align your head and shoulders inside the camera frame to calculate posture.'}
+                    </span>
+                    {!isTrackingLive && onToggleSimulation && (
+                      <button
+                        type="button"
+                        onClick={onToggleSimulation}
+                        className="text-indigo-600 hover:text-indigo-700 font-semibold whitespace-nowrap cursor-pointer"
+                      >
+                        Try Simulator &rarr;
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </>
+            );
+          })()}
 
         </div>
 

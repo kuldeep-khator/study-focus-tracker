@@ -1,7 +1,20 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { CameraOff, Sparkles, Sliders, RefreshCw, AlertCircle, ShieldCheck, Crosshair, CheckCircle2, Play, Eye } from 'lucide-react';
+import { CameraOff, Sparkles, Sliders, RefreshCw, AlertCircle, ShieldCheck, Crosshair, CheckCircle2, Play, Eye, Loader2 } from 'lucide-react';
 import { AppSettings, CalibrationData, FocusState, StudentProfile, TrackerMetrics } from '../types';
-import { analyzeFacialPose, drawComputerVisionHUD, RawLandmark } from '../utils/computerVision';
+import {
+  analyzeFacialPose,
+  analyzeUpperBodyPosture,
+  drawComputerVisionHUD,
+  RawLandmark,
+  RawPoseLandmark,
+} from '../utils/computerVision';
+import { createBackgroundInterval } from '../utils/backgroundTimer';
+import {
+  detectVisionFrame,
+  initSharedVisionModels,
+  subscribeVisionModelStatus,
+  VisionModelsState,
+} from '../utils/mediapipeManager';
 
 interface DistractionEventData {
   startTimestamp: number;
@@ -19,11 +32,13 @@ interface CameraTrackerProps {
   onMetricsUpdate: (metrics: TrackerMetrics) => void;
   onDistractionEventStart: (event: { startTimestamp: number; reason: string }) => void;
   onDistractionEventEnd: (event: { startTimestamp: number; endTimestamp: number; durationSeconds: number; reason: string }) => void;
+  onDistractionReminder?: (event: { durationSeconds: number; reason: string }) => void;
   onFocusRestored: () => void;
   onCameraUnavailable?: (isUnavailable: boolean) => void;
   isCalibrating: boolean;
   onCancelCalibration: () => void;
   onStartSession?: () => void;
+  onEnableSimulation?: () => void;
 }
 
 export const CameraTracker: React.FC<CameraTrackerProps> = ({
@@ -35,31 +50,56 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
   onMetricsUpdate,
   onDistractionEventStart,
   onDistractionEventEnd,
+  onDistractionReminder,
   onFocusRestored,
   onCameraUnavailable,
   isCalibrating,
   onCancelCalibration,
   onStartSession,
+  onEnableSimulation,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const imageCaptureRef = useRef<any>(null);
   const animationFrameRef = useRef<number | null>(null);
   const isMountedRef = useRef<boolean>(true);
+  const lastRafTimeRef = useRef<number>(performance.now());
 
-  // MediaPipe references
-  const faceMeshRef = useRef<any>(null);
+  // MediaPipe Tasks Vision references
+  const latestPoseLandmarksRef = useRef<RawPoseLandmark[] | null>(null);
   const isProcessingFrameRef = useRef<boolean>(false);
+  const lastPoseProcessedAtRef = useRef<number>(0);
+  const processingStartedAtRef = useRef<number>(0);
+  const [visionStatus, setVisionStatus] = useState<VisionModelsState>({
+    faceReady: false,
+    poseReady: false,
+    loading: false,
+    error: null,
+  });
+  const visionStatusRef = useRef<VisionModelsState>(visionStatus);
+  visionStatusRef.current = visionStatus;
 
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [permissionError, setPermissionError] = useState<string | null>(null);
-  const [isModelLoaded, setIsModelLoaded] = useState<boolean>(false);
   const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
 
   // Calibration state
   const [calibCountdown, setCalibCountdown] = useState<number>(5);
   const [calibSamplesCount, setCalibSamplesCount] = useState<number>(0);
-  const calibSamplesRef = useRef<Array<{ yaw: number; pitch: number; roll: number; gazeX: number; gazeY: number; faceX: number; faceY: number }>>([]);
+  const calibSamplesRef = useRef<Array<{
+    yaw: number;
+    pitch: number;
+    roll: number;
+    gazeX: number;
+    gazeY: number;
+    faceX: number;
+    faceY: number;
+    neckDropRatio?: number;
+    shoulderTilt?: number;
+    shoulderWidth?: number;
+  }>>([]);
 
   // Distraction tracking state machine refs
   const distractionSecondsRef = useRef<number>(0);
@@ -79,6 +119,7 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
   const [simulatedYaw, setSimulatedYaw] = useState<number>(0);
   const [simulatedPitch, setSimulatedPitch] = useState<number>(0);
   const [simulatedGaze, setSimulatedGaze] = useState<number>(0);
+  const [simulatedSlouch, setSimulatedSlouch] = useState<number>(0);
   const [simulatedNoFace, setSimulatedNoFace] = useState<boolean>(false);
 
   // Keep props fresh in refs for async tracking loop
@@ -91,6 +132,7 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     onMetricsUpdate,
     onDistractionEventStart,
     onDistractionEventEnd,
+    onDistractionReminder,
     onFocusRestored,
     onCameraUnavailable,
     isCalibrating,
@@ -106,6 +148,7 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
       onMetricsUpdate,
       onDistractionEventStart,
       onDistractionEventEnd,
+      onDistractionReminder,
       onFocusRestored,
       onCameraUnavailable,
       isCalibrating,
@@ -139,8 +182,10 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     const now = performance.now();
     const deltaMs = now - lastFrameTimeRef.current;
     lastFrameTimeRef.current = now;
-    if (deltaMs > 0 && deltaMs < 1000) {
-      fpsRef.current = Math.round(1000 / deltaMs);
+    if (deltaMs > 0 && deltaMs < 2000) {
+      fpsRef.current = Math.max(1, Math.round(1000 / deltaMs));
+    } else if (deltaMs >= 2000) {
+      fpsRef.current = 1;
     }
 
     // 1. Analyze Pose & Gaze against active profile baseline & limits
@@ -152,10 +197,25 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     );
 
     const metrics = analysis.metrics;
+
+    // 1b. Calculate Upper Body Posture from MediaPipe Pose (or head fallback)
+    const posture = analyzeUpperBodyPosture(
+      latestPoseLandmarksRef.current,
+      landmarks,
+      currentProfile,
+      metrics
+    );
+    metrics.posture = posture;
     latestMetricsRef.current = metrics;
 
-    // Collect calibration sample if in calibrating mode (collect raw pose)
+    // Collect calibration sample if in calibrating mode (collect raw pose + upper body posture)
     if (currentCalibrating && metrics.faceDetected) {
+      const poseLms = latestPoseLandmarksRef.current;
+      let shoulderWidth: number | undefined;
+      if (poseLms && poseLms.length > 12 && (poseLms[11]?.visibility ?? 1) > 0.35 && (poseLms[12]?.visibility ?? 1) > 0.35) {
+        shoulderWidth = Math.hypot(poseLms[12].x - poseLms[11].x, poseLms[12].y - poseLms[11].y);
+      }
+
       calibSamplesRef.current.push({
         yaw: metrics.rawYaw ?? metrics.yaw,
         pitch: metrics.rawPitch ?? metrics.pitch,
@@ -164,6 +224,9 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
         gazeY: metrics.rawGazeY ?? metrics.gazeY,
         faceX: metrics.rawFaceX ?? 0.5,
         faceY: metrics.rawFaceY ?? 0.5,
+        neckDropRatio: posture.shouldersDetected ? posture.neckDropRatio : undefined,
+        shoulderTilt: posture.shouldersDetected ? posture.shoulderTiltDeg : undefined,
+        shoulderWidth,
       });
       setCalibSamplesCount(calibSamplesRef.current.length);
     }
@@ -173,7 +236,8 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     const configuredDelay = currentProfile.distractionDelay || currentSettings.distractionThreshold || 5;
 
     if (currentActive && !currentPaused && !currentCalibrating) {
-      const deltaSec = deltaMs > 0 && deltaMs < 1000 ? deltaMs / 1000 : 0.033;
+      // Use real elapsed seconds even when throttled in background tabs (clamped to max 5s per frame step)
+      const deltaSec = deltaMs > 0 ? Math.min(deltaMs / 1000, 5) : 0.033;
       const isFacing = analysis.isFacingScreen && metrics.faceDetected;
 
       if (isFacing) {
@@ -223,10 +287,19 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
             });
             lastAlertTimeRef.current = Date.now();
           } else {
-            // Event is already active. Check notification cooldown for repeated sound alerts if needed
+            // Event is already active. Check notification cooldown for repeated reminder messages/alerts
+            const cooldown = currentSettings.notificationCooldown || 60;
             const timeSinceLastAlert = (Date.now() - lastAlertTimeRef.current) / 1000;
-            if (timeSinceLastAlert >= currentSettings.notificationCooldown) {
+            if (timeSinceLastAlert >= cooldown) {
               lastAlertTimeRef.current = Date.now();
+              const durationSeconds = Math.max(
+                Math.round((Date.now() - activeDistractionStartTimestampRef.current) / 1000),
+                configuredDelay
+              );
+              propsRef.current.onDistractionReminder?.({
+                durationSeconds,
+                reason: activeDistractionReasonRef.current || 'Still distracted away from study screen',
+              });
             }
           }
         }
@@ -247,11 +320,13 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
         });
         isDistractionEventOpenRef.current = false;
       }
+      distractionSecondsRef.current = 0;
       currentStateRef.current = 'PAUSED';
     } else {
       if (isDistractionEventOpenRef.current) {
         isDistractionEventOpenRef.current = false;
       }
+      distractionSecondsRef.current = 0;
       currentStateRef.current = 'IDLE';
     }
 
@@ -264,8 +339,8 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
       emitMetrics(metrics);
     }
 
-    // 3. Render Canvas Wireframe & HUD immediately on every frame
-    if (canvasRef.current) {
+    // 3. Render Canvas Wireframe & HUD when tab is visible
+    if (canvasRef.current && !document.hidden) {
       const ctx = canvasRef.current.getContext('2d');
       if (ctx) {
         drawComputerVisionHUD(
@@ -277,6 +352,7 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
           {
             showWireframe: currentSettings.wireframeOverlay,
             isCalibrating: currentCalibrating,
+            poseLandmarks: latestPoseLandmarksRef.current,
           }
         );
       }
@@ -286,43 +362,59 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
   const handleResultsRef = useRef(handleResults);
   handleResultsRef.current = handleResults;
 
-  // Optical fallback detector from video canvas if FaceMesh is loading
-  const estimateOpticalPose = useCallback((video: HTMLVideoElement): RawLandmark[] | null => {
-    try {
-      if (!canvasRef.current) return null;
-      const width = video.videoWidth || 640;
-      const height = video.videoHeight || 480;
-      const centerX = 0.5;
-      const centerY = 0.5;
+  // Canonical normalized face landmark builder used by Simulation Mode
+  const buildCanonicalFaceLandmarks = useCallback((): RawLandmark[] => {
+    const landmarks: RawLandmark[] = Array.from({ length: 478 }, () => ({ x: 0.5, y: 0.5, z: 0 }));
 
-      const landmarks: RawLandmark[] = [];
-      for (let i = 0; i < 478; i++) {
-        landmarks[i] = { x: centerX, y: centerY, z: 0 };
-      }
+    // Forehead, chin, cheeks (calibrated so neutral pose = 0° yaw, 0° pitch)
+    landmarks[10] = { x: 0.5, y: 0.26, z: 0 };
+    landmarks[152] = { x: 0.5, y: 0.74, z: 0 };
+    landmarks[234] = { x: 0.36, y: 0.5, z: 0 };
+    landmarks[454] = { x: 0.64, y: 0.5, z: 0 };
+    landmarks[1] = { x: 0.5, y: 0.4568, z: -0.05 };
 
-      landmarks[1] = { x: centerX, y: centerY, z: 0 };
-      landmarks[33] = { x: centerX - 0.08, y: centerY - 0.06, z: 0 };
-      landmarks[133] = { x: centerX - 0.04, y: centerY - 0.06, z: 0 };
-      landmarks[159] = { x: centerX - 0.06, y: centerY - 0.09, z: 0 };
-      landmarks[145] = { x: centerX - 0.06, y: centerY - 0.03, z: 0 };
-      landmarks[263] = { x: centerX + 0.08, y: centerY - 0.06, z: 0 };
-      landmarks[362] = { x: centerX + 0.04, y: centerY - 0.06, z: 0 };
-      landmarks[386] = { x: centerX + 0.08, y: centerY - 0.09, z: 0 };
-      landmarks[374] = { x: centerX + 0.08, y: centerY - 0.03, z: 0 };
-      landmarks[468] = { x: centerX - 0.08, y: centerY - 0.06, z: 0 };
-      landmarks[473] = { x: centerX + 0.08, y: centerY - 0.06, z: 0 };
+    // Left eye + iris (centered -> 0° gaze)
+    landmarks[33] = { x: 0.4, y: 0.43, z: 0 };
+    landmarks[133] = { x: 0.46, y: 0.43, z: 0 };
+    landmarks[159] = { x: 0.43, y: 0.415, z: 0 };
+    landmarks[145] = { x: 0.43, y: 0.445, z: 0 };
+    landmarks[468] = { x: 0.43, y: 0.43, z: 0 };
 
-      return landmarks;
-    } catch {
-      return null;
-    }
+    // Right eye + iris (centered -> 0° gaze)
+    landmarks[362] = { x: 0.54, y: 0.43, z: 0 };
+    landmarks[263] = { x: 0.6, y: 0.43, z: 0 };
+    landmarks[386] = { x: 0.57, y: 0.415, z: 0 };
+    landmarks[374] = { x: 0.57, y: 0.445, z: 0 };
+    landmarks[473] = { x: 0.57, y: 0.43, z: 0 };
+
+    // Silhouette oval points for clean wireframe visualization in Simulation Mode
+    const ovalPoints: Array<[number, number, number]> = [
+      [338, 0.55, 0.27], [297, 0.60, 0.30], [332, 0.63, 0.35], [284, 0.64, 0.40],
+      [251, 0.65, 0.45], [389, 0.64, 0.48], [356, 0.64, 0.50], [323, 0.63, 0.56],
+      [361, 0.62, 0.60], [288, 0.60, 0.64], [397, 0.58, 0.68], [365, 0.56, 0.70],
+      [379, 0.54, 0.72], [378, 0.52, 0.73], [400, 0.51, 0.74], [377, 0.50, 0.74],
+      [148, 0.49, 0.74], [176, 0.48, 0.73], [149, 0.46, 0.72], [150, 0.44, 0.70],
+      [136, 0.42, 0.68], [172, 0.40, 0.64], [58, 0.38, 0.60], [132, 0.37, 0.56],
+      [93, 0.36, 0.50], [127, 0.36, 0.48], [162, 0.35, 0.45], [21, 0.36, 0.40],
+      [54, 0.37, 0.35], [103, 0.40, 0.30], [67, 0.45, 0.27], [109, 0.47, 0.26],
+    ];
+    ovalPoints.forEach(([idx, x, y]) => {
+      landmarks[idx] = { x, y, z: 0 };
+    });
+
+    return landmarks;
   }, []);
 
   // MANDATED CAMERA SHUTDOWN METHOD: Immediately stops tracks & releases camera hardware
   const stopCameraStream = useCallback(() => {
+    imageCaptureRef.current = null;
+    latestPoseLandmarksRef.current = null;
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => {
         try {
+          track.onended = null;
+          track.onmute = null;
+          track.onunmute = null;
           track.stop();
         } catch (e) {
           console.debug('Error stopping camera track', e);
@@ -332,6 +424,10 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     }
     if (videoRef.current) {
       videoRef.current.srcObject = null;
+    }
+    if (canvasRef.current && !propsRef.current.settings.simulationMode) {
+      const ctx = canvasRef.current.getContext('2d');
+      ctx?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
     }
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
@@ -347,7 +443,6 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
       if (settings.simulationMode) {
         if (isMountedRef.current) {
           setHasPermission(true);
-          setIsModelLoaded(true);
           setIsCameraActive(true);
         }
         return;
@@ -378,6 +473,32 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
       }
 
       streamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        if (typeof (window as any).ImageCapture === 'function') {
+          try {
+            imageCaptureRef.current = new (window as any).ImageCapture(videoTrack);
+          } catch {
+            imageCaptureRef.current = null;
+          }
+        }
+        videoTrack.onended = () => {
+          if (isMountedRef.current) {
+            propsRef.current.onCameraUnavailable?.(true);
+          }
+        };
+        videoTrack.onmute = () => {
+          if (isMountedRef.current) {
+            propsRef.current.onCameraUnavailable?.(true);
+          }
+        };
+        videoTrack.onunmute = () => {
+          if (isMountedRef.current) {
+            propsRef.current.onCameraUnavailable?.(false);
+          }
+        };
+      }
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         try {
@@ -387,10 +508,13 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
         }
       }
 
+      lastFrameTimeRef.current = performance.now();
       setHasPermission(true);
-      setIsModelLoaded(true);
       setIsCameraActive(true);
       propsRef.current.onCameraUnavailable?.(false);
+
+      // Ensure MediaPipe Tasks Vision models are initialized
+      initSharedVisionModels().catch(() => {});
     } catch (err: any) {
       console.warn('Camera access error:', err);
       if (isMountedRef.current) {
@@ -417,65 +541,150 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     };
   }, [shouldCameraRun, startCamera, stopCameraStream]);
 
-  // Robust Main Frame Processing Loop (Uses requestAnimationFrame when tab is visible AND setInterval fallback for background tabs/switching apps)
+  // Reset metrics cleanly when returning to Standby (camera off & not in simulation mode)
   useEffect(() => {
-    if (!shouldCameraRun && !settings.simulationMode) return;
+    if (!shouldCameraRun && !settings.simulationMode) {
+      handleResultsRef.current(null);
+    }
+  }, [shouldCameraRun, settings.simulationMode]);
 
-    let animationId: number;
-    let backgroundIntervalId: NodeJS.Timeout | null = null;
-    let fallbackCounter = 0;
+  // Robust Main Frame Processing Loop:
+  // Uses requestAnimationFrame when tab is focused AND a Web Worker timer + ImageCapture fallback
+  // so webcam distraction & posture detection continues accurately in background tabs or windows.
+  useEffect(() => {
+    if (!shouldCameraRun || settings.simulationMode) return;
+
+    lastFrameTimeRef.current = performance.now();
+    lastRafTimeRef.current = performance.now();
+
+    let animationId = 0;
+    let isDisposed = false;
+
+    const getCaptureCanvas = (w: number, h: number): HTMLCanvasElement => {
+      if (!captureCanvasRef.current) {
+        captureCanvasRef.current = document.createElement('canvas');
+      }
+      if (captureCanvasRef.current.width !== w || captureCanvasRef.current.height !== h) {
+        captureCanvasRef.current.width = w;
+        captureCanvasRef.current.height = h;
+      }
+      return captureCanvasRef.current;
+    };
 
     const processSingleFrame = async () => {
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || isDisposed) return;
 
       const video = videoRef.current;
-      const isVideoPlaying = video && video.readyState >= 2 && !video.paused && video.videoWidth > 0;
+      const stream = streamRef.current;
+      const videoTrack = stream?.getVideoTracks()?.[0];
 
-      if (isVideoPlaying && !settings.simulationMode) {
-        if (faceMeshRef.current && !isProcessingFrameRef.current) {
-          isProcessingFrameRef.current = true;
-          try {
-            await faceMeshRef.current.send({ image: video });
-          } catch (e) {
-            console.debug('MediaPipe send frame error:', e);
-          } finally {
-            isProcessingFrameRef.current = false;
+      if (videoTrack && videoTrack.readyState === 'ended') {
+        propsRef.current.onCameraUnavailable?.(true);
+        return;
+      }
+
+      // Ensure video element stays playing if stream is still active (some browsers pause video on tab switch)
+      if (video && video.paused && stream && stream.active) {
+        video.play().catch(() => {});
+      }
+
+      // Prevent permanent deadlock if a previous inference call stalled
+      if (isProcessingFrameRef.current && performance.now() - processingStartedAtRef.current > 2000) {
+        isProcessingFrameRef.current = false;
+      }
+
+      const isVideoPlaying = Boolean(video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0);
+      const isBackgrounded = document.hidden || performance.now() - lastRafTimeRef.current > 350;
+
+      if (!visionStatusRef.current.faceReady) {
+        return;
+      }
+
+      if ((isVideoPlaying || (isBackgrounded && imageCaptureRef.current)) && !isProcessingFrameRef.current) {
+        isProcessingFrameRef.current = true;
+        processingStartedAtRef.current = performance.now();
+        try {
+          let imageSource: HTMLVideoElement | HTMLCanvasElement | null = isVideoPlaying ? video : null;
+
+          // In background tabs / occluded windows, browsers often freeze <video> compositing;
+          // use ImageCapture.grabFrame() to pull fresh camera frames directly from the hardware track.
+          if (isBackgrounded && imageCaptureRef.current) {
+            try {
+              const bitmap: ImageBitmap = await Promise.race([
+                imageCaptureRef.current.grabFrame(),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('grabFrame timeout')), 500)),
+              ]);
+              const captureCanvas = getCaptureCanvas(bitmap.width || 640, bitmap.height || 480);
+              const ctx = captureCanvas.getContext('2d');
+              if (ctx) {
+                ctx.drawImage(bitmap, 0, 0, captureCanvas.width, captureCanvas.height);
+                imageSource = captureCanvas;
+              }
+              bitmap.close();
+            } catch {
+              if (isVideoPlaying && video) {
+                const captureCanvas = getCaptureCanvas(video.videoWidth || 640, video.videoHeight || 480);
+                const ctx = captureCanvas.getContext('2d');
+                if (ctx) {
+                  ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+                  imageSource = captureCanvas;
+                }
+              }
+            }
           }
-        } else if (!faceMeshRef.current) {
-          fallbackCounter++;
-          if (fallbackCounter % 2 === 0) {
-            const fallbackLandmarks = estimateOpticalPose(video);
-            handleResultsRef.current(fallbackLandmarks);
+
+          if (imageSource) {
+            const nowMs = performance.now();
+            const shouldRunPose =
+              visionStatusRef.current.poseReady &&
+              nowMs - lastPoseProcessedAtRef.current >= 280;
+
+            if (shouldRunPose) {
+              lastPoseProcessedAtRef.current = nowMs;
+            }
+
+            const visionResult = detectVisionFrame(imageSource, { runPose: shouldRunPose });
+            if (visionResult.poseUpdated) {
+              latestPoseLandmarksRef.current = visionResult.poseLandmarks;
+            }
+
+            handleResultsRef.current(visionResult.faceLandmarks);
           }
+        } catch (e) {
+          console.debug('Tasks Vision frame processing error:', e);
+        } finally {
+          isProcessingFrameRef.current = false;
         }
       }
     };
 
     const runRafLoop = () => {
-      if (document.hidden) return;
+      if (document.hidden || isDisposed) return;
+      lastRafTimeRef.current = performance.now();
       processSingleFrame().finally(() => {
-        if (!document.hidden && isMountedRef.current) {
+        if (!document.hidden && isMountedRef.current && !isDisposed) {
           animationId = requestAnimationFrame(runRafLoop);
         }
       });
     };
 
-    // When tab is visible, run high-frequency rAF loop
     if (!document.hidden) {
       animationId = requestAnimationFrame(runRafLoop);
     }
 
-    // Always maintain background interval timer (e.g. every 200ms) to ensure continuous monitoring even when browser throttles background tabs
-    backgroundIntervalId = setInterval(() => {
-      if (document.hidden) {
+    // Web Worker timer runs unthrottled in the background (~250ms) when tab is hidden OR another browser/window covers it
+    const stopBackgroundWorker = createBackgroundInterval(() => {
+      if (isDisposed || !isMountedRef.current) return;
+      const isRafStale = performance.now() - lastRafTimeRef.current > 350;
+      if (document.hidden || isRafStale) {
         processSingleFrame();
       }
-    }, 200);
+    }, 250);
 
     const handleVisibilityChange = () => {
-      if (!document.hidden) {
-        // Tab became visible again -> kick off rAF loop
-        cancelAnimationFrame(animationId);
+      if (!document.hidden && !isDisposed) {
+        lastRafTimeRef.current = performance.now();
+        if (animationId) cancelAnimationFrame(animationId);
         animationId = requestAnimationFrame(runRafLoop);
       }
     };
@@ -483,11 +692,12 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      isDisposed = true;
       if (animationId) cancelAnimationFrame(animationId);
-      if (backgroundIntervalId) clearInterval(backgroundIntervalId);
+      stopBackgroundWorker();
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [shouldCameraRun, settings.simulationMode, estimateOpticalPose]);
+  }, [shouldCameraRun, settings.simulationMode]);
 
   // Guided 5-Second Calibration Countdown
   useEffect(() => {
@@ -518,6 +728,10 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
           const avgFaceX = samples.reduce((acc, s) => acc + s.faceX, 0) / samples.length;
           const avgFaceY = samples.reduce((acc, s) => acc + s.faceY, 0) / samples.length;
 
+          const neckSamples = samples.filter((s) => typeof s.neckDropRatio === 'number');
+          const tiltSamples = samples.filter((s) => typeof s.shoulderTilt === 'number');
+          const widthSamples = samples.filter((s) => typeof s.shoulderWidth === 'number');
+
           propsRef.current.onCalibrationComplete({
             baselineYaw: Math.round(avgYaw * 10) / 10,
             baselinePitch: Math.round(avgPitch * 10) / 10,
@@ -527,6 +741,18 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
             baselineFaceX: Math.round(avgFaceX * 100) / 100,
             baselineFaceY: Math.round(avgFaceY * 100) / 100,
             baselineFaceScale: 1.0,
+            baselineNeckDropRatio:
+              neckSamples.length > 0
+                ? Math.round((neckSamples.reduce((a, s) => a + (s.neckDropRatio || 0), 0) / neckSamples.length) * 1000) / 1000
+                : undefined,
+            baselineShoulderTilt:
+              tiltSamples.length > 0
+                ? Math.round((tiltSamples.reduce((a, s) => a + (s.shoulderTilt || 0), 0) / tiltSamples.length) * 10) / 10
+                : undefined,
+            baselineShoulderWidth:
+              widthSamples.length > 0
+                ? Math.round((widthSamples.reduce((a, s) => a + (s.shoulderWidth || 0), 0) / widthSamples.length) * 1000) / 1000
+                : undefined,
             isCalibrated: true,
             calibratedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           });
@@ -549,104 +775,105 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
     return () => clearInterval(timer);
   }, [isCalibrating]);
 
-  // Load MediaPipe FaceMesh
+  // Preload singleton MediaPipe Tasks Vision FaceLandmarker & PoseLandmarker models on mount
   useEffect(() => {
-    let active = true;
-
-    async function loadScript(src: string): Promise<boolean> {
-      return new Promise((resolve) => {
-        if (document.querySelector(`script[src="${src}"]`)) {
-          resolve(true);
-          return;
-        }
-        const script = document.createElement('script');
-        script.src = src;
-        script.crossOrigin = 'anonymous';
-        script.onload = () => resolve(true);
-        script.onerror = () => resolve(false);
-        document.head.appendChild(script);
-      });
-    }
-
-    async function initFaceMesh() {
-      try {
-        if (!(window as any).FaceMesh) {
-          await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js');
-        }
-
-        const AvailableFaceMesh = (window as any).FaceMesh;
-        if (AvailableFaceMesh && !faceMeshRef.current) {
-          const instance = new AvailableFaceMesh({
-            locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`,
-          });
-
-          instance.setOptions({
-            maxNumFaces: 1,
-            refineLandmarks: true,
-            minDetectionConfidence: 0.5,
-            minTrackingConfidence: 0.5,
-          });
-
-          instance.onResults((results: any) => {
-            if (!isMountedRef.current) return;
-            const landmarks = results.multiFaceLandmarks && results.multiFaceLandmarks[0];
-            handleResultsRef.current(landmarks || null);
-          });
-
-          faceMeshRef.current = instance;
-          if (active && isMountedRef.current) {
-            setIsModelLoaded(true);
-          }
-        }
-      } catch (err) {
-        console.warn('FaceMesh init:', err);
+    const unsubscribe = subscribeVisionModelStatus((status) => {
+      if (isMountedRef.current) {
+        setVisionStatus(status);
       }
-    }
+    });
 
-    initFaceMesh();
+    initSharedVisionModels().catch((err) => {
+      console.warn('Tasks Vision preload:', err);
+    });
 
     return () => {
-      active = false;
-      if (faceMeshRef.current) {
-        try { faceMeshRef.current.close(); } catch (e) { /* ignore */ }
-        faceMeshRef.current = null;
-      }
+      unsubscribe();
     };
   }, []);
 
-  // Synthetic Landmark Loop for Simulation
+  // Synthetic Landmark Loop for Simulation (also works when backgrounded via Web Worker timer)
   useEffect(() => {
     if (!settings.simulationMode) return;
 
-    let frameId: number;
-    const generateSyntheticFrame = () => {
-      if (!isMountedRef.current) return;
+    let frameId = 0;
+    let isDisposed = false;
+    let lastSimRaf = performance.now();
+
+    const emitSynthetic = () => {
+      if (!isMountedRef.current || isDisposed) return;
 
       if (!simulatedNoFace) {
-        const synthetic = estimateOpticalPose({ videoWidth: 640, videoHeight: 480 } as any);
-        if (synthetic) {
-          const yawOffset = (simulatedYaw / 45) * 0.08;
-          const pitchOffset = (simulatedPitch / 35) * 0.06;
-          const gazeOffset = (simulatedGaze / 30) * 0.04;
+        const synthetic = buildCanonicalFaceLandmarks();
+        // Accurate inverse geometry scaling for FaceMesh pose landmarks
+        const yawOffset = Math.sin((simulatedYaw / 1.35) * (Math.PI / 180)) * 0.14;
+        const pitchOffset = (simulatedPitch / 65) * 0.24;
+        const gazeOffset = (simulatedGaze / 55) * 0.06;
 
-          synthetic[1] = { x: 0.5 + yawOffset, y: 0.5 + pitchOffset, z: 0 };
-          synthetic[468] = { x: 0.42 + yawOffset + gazeOffset, y: 0.44 + pitchOffset, z: 0 };
-          synthetic[473] = { x: 0.58 + yawOffset + gazeOffset, y: 0.44 + pitchOffset, z: 0 };
+        synthetic[1] = { x: 0.5 + yawOffset, y: 0.4568 + pitchOffset, z: -0.05 };
+        synthetic[468] = { x: 0.43 + gazeOffset, y: 0.43 + pitchOffset * 0.3, z: 0 };
+        synthetic[473] = { x: 0.57 + gazeOffset, y: 0.43 + pitchOffset * 0.3, z: 0 };
 
-          handleResultsRef.current(synthetic);
-        }
+        // Synthetic upper-body pose landmarks (shoulders, ears, nose) driven by simulatedSlouch
+        const slouchFactor = simulatedSlouch / 35;
+        const slouchDrop = slouchFactor * 0.12;
+        const shoulderHalfWidth = 0.21 + slouchFactor * 0.025;
+        const simPose: RawPoseLandmark[] = Array.from({ length: 15 }, () => ({
+          x: 0.5,
+          y: 0.5,
+          z: 0,
+          visibility: 0.9,
+        }));
+        simPose[0] = { x: 0.5 + yawOffset * 0.5, y: 0.52 + slouchDrop, z: -0.08 - slouchFactor * 0.22, visibility: 0.95 };
+        simPose[7] = { x: 0.43 + yawOffset * 0.5, y: 0.5436 + slouchDrop, z: -0.05 - slouchFactor * 0.22, visibility: 0.92 };
+        simPose[8] = { x: 0.57 + yawOffset * 0.5, y: 0.5436 + slouchDrop, z: -0.05 - slouchFactor * 0.22, visibility: 0.92 };
+        simPose[11] = { x: 0.5 - shoulderHalfWidth, y: 0.72, z: 0, visibility: 0.95 };
+        simPose[12] = { x: 0.5 + shoulderHalfWidth, y: 0.72 + (simulatedSlouch > 24 ? 0.045 : 0), z: 0, visibility: 0.95 };
+        simPose[13] = { x: 0.24, y: 0.92, z: 0, visibility: 0.7 };
+        simPose[14] = { x: 0.76, y: 0.92, z: 0, visibility: 0.7 };
+        latestPoseLandmarksRef.current = simPose;
+
+        handleResultsRef.current(synthetic);
       } else {
+        latestPoseLandmarksRef.current = null;
         handleResultsRef.current(null);
       }
+    };
 
+    const generateSyntheticFrame = () => {
+      if (document.hidden || isDisposed) return;
+      lastSimRaf = performance.now();
+      emitSynthetic();
       frameId = requestAnimationFrame(generateSyntheticFrame);
     };
 
-    frameId = requestAnimationFrame(generateSyntheticFrame);
-    return () => {
-      if (frameId) cancelAnimationFrame(frameId);
+    if (!document.hidden) {
+      frameId = requestAnimationFrame(generateSyntheticFrame);
+    }
+
+    const stopWorker = createBackgroundInterval(() => {
+      if (isDisposed || !isMountedRef.current) return;
+      if (document.hidden || performance.now() - lastSimRaf > 350) {
+        emitSynthetic();
+      }
+    }, 200);
+
+    const onVisibility = () => {
+      if (!document.hidden && !isDisposed) {
+        lastSimRaf = performance.now();
+        if (frameId) cancelAnimationFrame(frameId);
+        frameId = requestAnimationFrame(generateSyntheticFrame);
+      }
     };
-  }, [settings.simulationMode, simulatedYaw, simulatedPitch, simulatedGaze, simulatedNoFace, estimateOpticalPose]);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      isDisposed = true;
+      if (frameId) cancelAnimationFrame(frameId);
+      stopWorker();
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [settings.simulationMode, simulatedYaw, simulatedPitch, simulatedGaze, simulatedSlouch, simulatedNoFace, buildCanonicalFaceLandmarks]);
 
   return (
     <div className="relative rounded-2xl overflow-hidden bg-slate-950 border border-slate-200 shadow-xs">
@@ -684,16 +911,28 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
             <p className="text-xs text-slate-400 max-w-sm mb-4 leading-relaxed">
               Camera turns ON exclusively during active study sessions and stops immediately when you end the session.
             </p>
-            {onStartSession && (
-              <button
-                id="btn-camera-standby-start"
-                onClick={onStartSession}
-                className="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors flex items-center gap-1.5 cursor-pointer shadow-sm"
-              >
-                <Play className="w-3.5 h-3.5 fill-white" />
-                Start Study Session & Activate Camera
-              </button>
-            )}
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              {onStartSession && (
+                <button
+                  id="btn-camera-standby-start"
+                  onClick={onStartSession}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition-colors flex items-center gap-1.5 cursor-pointer shadow-sm"
+                >
+                  <Play className="w-3.5 h-3.5 fill-white" />
+                  Start Study Session & Activate Camera
+                </button>
+              )}
+              {onEnableSimulation && (
+                <button
+                  id="btn-camera-standby-sim"
+                  onClick={onEnableSimulation}
+                  className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Sliders className="w-3.5 h-3.5 text-indigo-400" />
+                  Test in Simulator
+                </button>
+              )}
+            </div>
           </div>
         )}
 
@@ -703,8 +942,16 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
             <Eye className="w-10 h-10 text-indigo-400 mb-2" />
             <p className="text-sm font-medium text-slate-200">Camera preview hidden (Focus Mode)</p>
             <p className="text-xs text-slate-400 mt-1 max-w-xs">
-              AI computer vision is silently monitoring head & eye alignment in the background.
+              AI computer vision is silently monitoring head, eye &amp; upper-body alignment in the background.
             </p>
+          </div>
+        )}
+
+        {/* AI Vision Loading Overlay when camera is active and model is initializing */}
+        {shouldCameraRun && !settings.simulationMode && hasPermission !== false && !visionStatus.faceReady && (
+          <div className="absolute top-3 right-3 z-30 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium bg-indigo-950/90 text-indigo-200 border border-indigo-500/30 backdrop-blur-xs">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+            <span>{visionStatus.error ? 'AI Vision Fallback' : 'Loading Face & Posture AI...'}</span>
           </div>
         )}
 
@@ -725,6 +972,16 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
                 <RefreshCw className="w-3.5 h-3.5" />
                 Retry Camera Access
               </button>
+              {onEnableSimulation && (
+                <button
+                  id="btn-error-use-simulator"
+                  onClick={onEnableSimulation}
+                  className="px-4 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Sliders className="w-3.5 h-3.5 text-indigo-400" />
+                  Use Simulator Instead
+                </button>
+              )}
             </div>
             {permissionError && (
               <p className="text-[11px] text-slate-400 mt-3 font-mono">
@@ -772,7 +1029,7 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
         <div className="absolute top-3 left-3 z-20 flex items-center gap-2">
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono bg-slate-900/90 text-emerald-400 border border-emerald-500/20 backdrop-blur-xs">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            {shouldCameraRun ? 'Camera Live (Local Device)' : 'Camera OFF'}
+            {settings.simulationMode ? 'Simulator Live' : shouldCameraRun ? 'Camera Live (Local Device)' : 'Camera OFF'}
           </span>
           {activeProfile.isCalibrated ? (
             <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium bg-indigo-950/90 text-indigo-300 border border-indigo-500/30">
@@ -795,19 +1052,31 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
               <Sliders className="w-3.5 h-3.5" />
               Interactive Vision Simulator ({activeProfile.name})
             </span>
-            <button
-              onClick={() => {
-                setSimulatedYaw(0);
-                setSimulatedPitch(0);
-                setSimulatedGaze(0);
-                setSimulatedNoFace(false);
-              }}
-              className="text-[11px] text-indigo-600 hover:underline font-medium cursor-pointer"
-            >
-              Reset to Center
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => {
+                  setSimulatedYaw(0);
+                  setSimulatedPitch(0);
+                  setSimulatedGaze(0);
+                  setSimulatedSlouch(0);
+                  setSimulatedNoFace(false);
+                }}
+                className="text-[11px] text-indigo-600 hover:underline font-medium cursor-pointer"
+              >
+                Reset to Center
+              </button>
+              {onEnableSimulation && (
+                <button
+                  id="btn-exit-simulator"
+                  onClick={onEnableSimulation}
+                  className="text-[11px] text-slate-500 hover:text-slate-800 font-medium cursor-pointer px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 transition-colors"
+                >
+                  Exit Simulator
+                </button>
+              )}
+            </div>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
               <div className="flex justify-between text-[11px] text-slate-600 mb-1">
                 <span>Head Yaw (Left/Right)</span>
@@ -851,6 +1120,21 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
                 className="w-full accent-indigo-600"
               />
             </div>
+            <div className="p-2.5 bg-slate-50 rounded-lg border border-slate-200">
+              <div className="flex justify-between text-[11px] text-slate-600 mb-1">
+                <span>Upper Body Slouch</span>
+                <span className="font-mono font-semibold">{simulatedSlouch}°</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="35"
+                step="1"
+                value={simulatedSlouch}
+                onChange={e => setSimulatedSlouch(Number(e.target.value))}
+                className="w-full accent-indigo-600"
+              />
+            </div>
           </div>
           <div className="flex flex-wrap gap-2 mt-3 pt-3 border-t border-slate-100">
             <button
@@ -864,6 +1148,12 @@ export const CameraTracker: React.FC<CameraTrackerProps> = ({
               className="px-2.5 py-1.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-medium border border-slate-200 cursor-pointer"
             >
               {simulatedGaze === 0 ? 'Simulate Eyes Diverted (25°)' : 'Reset Eyes'}
+            </button>
+            <button
+              onClick={() => setSimulatedSlouch(prev => (prev === 0 ? 26 : 0))}
+              className="px-2.5 py-1.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-medium border border-slate-200 cursor-pointer"
+            >
+              {simulatedSlouch === 0 ? 'Simulate Slouching (26°)' : 'Reset Posture'}
             </button>
             <button
               onClick={() => setSimulatedNoFace(prev => !prev)}

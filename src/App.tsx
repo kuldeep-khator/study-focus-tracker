@@ -37,9 +37,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   cameraPreview: true,
   wireframeOverlay: true,
   audioAlerts: true,
-  browserNotifications: false,
+  browserNotifications: true,
   dailyGoalMinutes: 120,
   simulationMode: false,
+  promptEmailOnSessionSave: false,
+  preferredReportEmail: '',
 };
 
 const DEFAULT_CALIBRATION: CalibrationData = {
@@ -308,6 +310,9 @@ export default function App() {
         baselineRoll: calib.baselineRoll,
         baselineGazeX: calib.baselineGazeX,
         baselineGazeY: calib.baselineGazeY,
+        baselineNeckDropRatio: calib.baselineNeckDropRatio ?? activeProfile.baselineNeckDropRatio,
+        baselineShoulderTilt: calib.baselineShoulderTilt ?? activeProfile.baselineShoulderTilt,
+        baselineShoulderWidth: calib.baselineShoulderWidth ?? activeProfile.baselineShoulderWidth,
         isCalibrated: true,
         calibratedAt: calib.calibratedAt,
       };
@@ -323,6 +328,14 @@ export default function App() {
     setCompletedSession(session);
     setFocusState('IDLE');
     saveFirestoreStudySession(currentUser.id, session).catch(err => console.error(err));
+  };
+
+  // Update session in state & Firestore without closing modal
+  const handleUpdateSession = (updatedSession: StudySession) => {
+    if (!currentUser) return;
+    setSessions(prev => prev.map(s => (s.id === updatedSession.id ? updatedSession : s)));
+    setCompletedSession(prev => (prev && prev.id === updatedSession.id ? updatedSession : prev));
+    saveFirestoreStudySession(currentUser.id, updatedSession).catch(err => console.error(err));
   };
 
   // Update session from summary modal (with notes & AI Coach summary)
@@ -368,6 +381,9 @@ export default function App() {
         baselineRoll: 0,
         baselineGazeX: 0,
         baselineGazeY: 0,
+        baselineNeckDropRatio: undefined,
+        baselineShoulderTilt: undefined,
+        baselineShoulderWidth: undefined,
         isCalibrated: false,
         calibratedAt: undefined,
       });
@@ -490,6 +506,7 @@ export default function App() {
               setLatestMetrics(m);
               setFocusState(m.state);
             }}
+            onToggleSimulation={() => handleUpdateSettings({ ...settings, simulationMode: !settings.simulationMode })}
             userId={currentUser.id}
           />
         )}
@@ -503,6 +520,8 @@ export default function App() {
         {activeTab === 'history' && (
           <SessionHistoryView
             sessions={sessions}
+            userEmail={settings.preferredReportEmail || currentUser.email}
+            onUpdateSession={handleUpdateSession}
             onDeleteSession={handleDeleteSession}
           />
         )}
@@ -513,6 +532,7 @@ export default function App() {
             settings={settings}
             calibration={calibration}
             sessions={sessions}
+            userEmail={currentUser.email}
             onUpdateSettings={handleUpdateSettings}
             onClearSessions={handleClearSessions}
             onClearAllData={handleClearAllData}
@@ -527,7 +547,10 @@ export default function App() {
       {completedSession && (
         <SessionSummaryModal
           session={completedSession}
+          userEmail={settings.preferredReportEmail || currentUser.email}
+          autoOpenEmailPrompt={Boolean(settings.promptEmailOnSessionSave)}
           onSaveAndClose={handleSaveModalSession}
+          onUpdateSession={handleUpdateSession}
           onStartNewSession={() => {
             setCompletedSession(null);
             setActiveTab('session');

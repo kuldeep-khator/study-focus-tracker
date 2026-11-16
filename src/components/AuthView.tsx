@@ -4,7 +4,7 @@ import {
   CheckCircle2, AlertCircle, Eye, EyeOff, KeyRound, RefreshCw, Send
 } from 'lucide-react';
 import { User } from '../types';
-import { auth, googleAuthProvider } from '../lib/firebase';
+import { auth, googleAuthProvider, setGmailAccessToken } from '../lib/firebase';
 import { 
   createUserWithEmailAndPassword, 
   signInWithEmailAndPassword, 
@@ -13,6 +13,7 @@ import {
   signInWithPopup,
   signOut,
   reload,
+  GoogleAuthProvider,
   User as FirebaseUser
 } from 'firebase/auth';
 import { createFirestoreUserProfile, getFirestoreUserProfile, updateFirestoreUserVerification } from '../utils/firestore';
@@ -345,6 +346,10 @@ export const AuthView: React.FC<AuthViewProps> = ({
 
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
+      const oauthCred = GoogleAuthProvider.credentialFromResult(cred);
+      if (oauthCred?.accessToken) {
+        setGmailAccessToken(oauthCred.accessToken);
+      }
       const fbUser = cred.user;
 
       await createFirestoreUserProfile(fbUser.uid, {

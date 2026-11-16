@@ -1,9 +1,13 @@
-import { CalibrationData, StudentProfile, TrackerMetrics } from '../types';
+import { CalibrationData, PostureStatus, StudentProfile, TrackerMetrics, UpperBodyPostureMetrics } from '../types';
 
 export interface RawLandmark {
   x: number;
   y: number;
   z: number;
+}
+
+export interface RawPoseLandmark extends RawLandmark {
+  visibility?: number;
 }
 
 export interface VisionAnalysisResult {
@@ -47,6 +51,173 @@ let smoothedPitch = 0;
 let smoothedGazeX = 0;
 let smoothedFaceX = 0.5;
 let smoothedFaceY = 0.5;
+let smoothedPostureScore = 100;
+let smoothedShoulderTilt = 0;
+let smoothedSlouchAngle = 0;
+
+/**
+ * Calculates upper-body posture (shoulder alignment, neck compression / forward slouch,
+ * forward lean) using MediaPipe Pose landmarks (shoulders, ears, nose) with an automatic
+ * head-geometry fallback when shoulders are outside the webcam frame.
+ */
+export function analyzeUpperBodyPosture(
+  poseLandmarks: RawPoseLandmark[] | null,
+  faceLandmarks: RawLandmark[] | null,
+  calibrationOrProfile: CalibrationData | StudentProfile,
+  faceMetrics?: Partial<TrackerMetrics>
+): UpperBodyPostureMetrics {
+  const baseNeckDrop = calibrationOrProfile.baselineNeckDropRatio ?? 0.42;
+  const baseShoulderTilt = calibrationOrProfile.baselineShoulderTilt ?? 0;
+  const baseShoulderWidth = calibrationOrProfile.baselineShoulderWidth ?? 0.42;
+
+  const hasPose = Boolean(poseLandmarks && poseLandmarks.length > 12);
+  const leftShoulder = hasPose ? poseLandmarks![11] : null;
+  const rightShoulder = hasPose ? poseLandmarks![12] : null;
+  const shouldersVisible = Boolean(
+    leftShoulder &&
+    rightShoulder &&
+    (leftShoulder.visibility ?? 1) > 0.35 &&
+    (rightShoulder.visibility ?? 1) > 0.35
+  );
+
+  if (shouldersVisible && leftShoulder && rightShoulder) {
+    const nose = poseLandmarks![0];
+    const leftEar = poseLandmarks![7];
+    const rightEar = poseLandmarks![8];
+
+    const shoulderMidX = (leftShoulder.x + rightShoulder.x) / 2;
+    const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2;
+    const shoulderMidZ = ((leftShoulder.z || 0) + (rightShoulder.z || 0)) / 2;
+    const shoulderWidth = Math.hypot(rightShoulder.x - leftShoulder.x, rightShoulder.y - leftShoulder.y) || 0.25;
+
+    // 1. Shoulder tilt angle in degrees (positive = right shoulder lower)
+    const rawTiltDeg =
+      Math.atan2(rightShoulder.y - leftShoulder.y, Math.abs(rightShoulder.x - leftShoulder.x) || 0.001) *
+      (180 / Math.PI);
+
+    // 2. Neck vertical extension relative to shoulder width
+    const earsVisible =
+      leftEar &&
+      rightEar &&
+      (leftEar.visibility ?? 1) > 0.35 &&
+      (rightEar.visibility ?? 1) > 0.35;
+
+    const headAnchorY = earsVisible
+      ? (leftEar.y + rightEar.y) / 2
+      : nose
+      ? nose.y
+      : shoulderMidY - 0.18;
+
+    const headAnchorZ = earsVisible
+      ? ((leftEar.z || 0) + (rightEar.z || 0)) / 2
+      : nose
+      ? nose.z || 0
+      : shoulderMidZ;
+
+    const verticalGap = Math.max(0.01, shoulderMidY - headAnchorY);
+    const neckDropRatio = Math.round((verticalGap / shoulderWidth) * 1000) / 1000;
+
+    // 3. Forward lean percentage relative to calibrated shoulder width
+    const forwardLeanPct = Math.round(((shoulderWidth - baseShoulderWidth) / (baseShoulderWidth || 0.42)) * 100);
+
+    // 4. Forward slouch angle combining Z-depth head protrusion + vertical neck drop
+    const zForward = Math.max(0, shoulderMidZ - headAnchorZ - 0.08);
+    const neckCompression = Math.max(0, baseNeckDrop - neckDropRatio);
+    const rawSlouchDeg = Math.min(
+      60,
+      Math.max(0, zForward * 110 + neckCompression * 95 + Math.max(0, forwardLeanPct) * 0.35)
+    );
+
+    const relTilt = Math.abs(rawTiltDeg - baseShoulderTilt);
+    const tiltPenalty = Math.max(0, relTilt - 4) * 2.6;
+    const slouchPenalty = Math.max(0, rawSlouchDeg - 7) * 1.7;
+    const leanPenalty = Math.max(0, forwardLeanPct - 12) * 1.1;
+
+    const rawScore = Math.max(0, Math.min(100, Math.round(100 - tiltPenalty - slouchPenalty - leanPenalty)));
+
+    smoothedPostureScore = Math.round(smoothedPostureScore * 0.6 + rawScore * 0.4);
+    smoothedShoulderTilt = Math.round((smoothedShoulderTilt * 0.6 + (rawTiltDeg - baseShoulderTilt) * 0.4) * 10) / 10;
+    smoothedSlouchAngle = Math.round((smoothedSlouchAngle * 0.6 + rawSlouchDeg * 0.4) * 10) / 10;
+
+    let postureStatus: PostureStatus = 'UPRIGHT';
+    let postureFeedback = 'Upper body posture is upright and well-aligned.';
+
+    if (Math.abs(smoothedShoulderTilt) > 8) {
+      postureStatus = 'UNEVEN_SHOULDERS';
+      postureFeedback = `Shoulders tilted (${smoothedShoulderTilt > 0 ? '+' : ''}${smoothedShoulderTilt}°) — level both shoulders.`;
+    } else if (smoothedPostureScore < 65) {
+      postureStatus = 'SLOUCHING';
+      postureFeedback = 'Slouching or forward neck lean detected — sit back and lift your chest.';
+    } else if (smoothedPostureScore < 82) {
+      postureStatus = 'SLIGHT_SLOUCH';
+      postureFeedback = 'Slight forward slouch — relax shoulders back over your hips.';
+    }
+
+    return {
+      postureScore: smoothedPostureScore,
+      postureStatus,
+      shoulderTiltDeg: smoothedShoulderTilt,
+      slouchAngleDeg: smoothedSlouchAngle,
+      neckDropRatio,
+      forwardLeanPct,
+      shouldersDetected: true,
+      postureFeedback,
+    };
+  }
+
+  // Fallback: estimate upper posture from head height drop, pitch & roll when shoulders are out of frame
+  if (faceLandmarks && faceLandmarks.length >= 468 && faceMetrics) {
+    const faceYDrop = Math.max(0, (faceMetrics.rawFaceY ?? 0.5) - ((calibrationOrProfile as any).baselineFaceY ?? 0.5));
+    const headPitchDrop = Math.max(0, -(faceMetrics.pitch ?? 0));
+    const headRoll = Math.abs(faceMetrics.roll ?? 0);
+
+    const estSlouch = Math.min(45, Math.round((faceYDrop * 120 + Math.max(0, headPitchDrop - 8) * 0.9) * 10) / 10);
+    const estScore = Math.max(
+      0,
+      Math.min(100, Math.round(100 - Math.max(0, estSlouch - 6) * 2.1 - Math.max(0, headRoll - 7) * 2.0))
+    );
+
+    smoothedPostureScore = Math.round(smoothedPostureScore * 0.65 + estScore * 0.35);
+    smoothedSlouchAngle = Math.round((smoothedSlouchAngle * 0.65 + estSlouch * 0.35) * 10) / 10;
+    smoothedShoulderTilt = Math.round(((faceMetrics.roll ?? 0) * 0.5) * 10) / 10;
+
+    let postureStatus: PostureStatus = 'UPRIGHT';
+    let postureFeedback = 'Estimated upper posture is upright (step back slightly for shoulder tracking).';
+
+    if (headRoll > 12) {
+      postureStatus = 'UNEVEN_SHOULDERS';
+      postureFeedback = 'Head/upper torso tilted — straighten your posture.';
+    } else if (smoothedPostureScore < 65) {
+      postureStatus = 'SLOUCHING';
+      postureFeedback = 'Upper posture dropping forward — sit upright at eye level.';
+    } else if (smoothedPostureScore < 82) {
+      postureStatus = 'SLIGHT_SLOUCH';
+      postureFeedback = 'Slight downward posture drift — sit tall.';
+    }
+
+    return {
+      postureScore: smoothedPostureScore,
+      postureStatus,
+      shoulderTiltDeg: smoothedShoulderTilt,
+      slouchAngleDeg: smoothedSlouchAngle,
+      neckDropRatio: baseNeckDrop,
+      forwardLeanPct: 0,
+      shouldersDetected: false,
+      postureFeedback,
+    };
+  }
+
+  return {
+    postureScore: 0,
+    postureStatus: 'UNKNOWN',
+    shoulderTiltDeg: 0,
+    slouchAngleDeg: 0,
+    neckDropRatio: 0,
+    forwardLeanPct: 0,
+    shouldersDetected: false,
+    postureFeedback: 'Waiting for upper body detection in camera frame.',
+  };
+}
 
 export function analyzeFacialPose(
   landmarks: RawLandmark[],
@@ -313,16 +484,77 @@ export function analyzeFacialPose(
   };
 }
 
-// Canvas Visualizer: Renders OpenCV-style computer vision overlay with Custom Focus Boundary reticles
+// Canvas Visualizer: Renders OpenCV-style computer vision overlay with Custom Focus Boundary reticles + Upper Body Posture skeleton
 export function drawComputerVisionHUD(
   ctx: CanvasRenderingContext2D,
   landmarks: RawLandmark[] | null,
   width: number,
   height: number,
   metrics: TrackerMetrics,
-  options: { showWireframe: boolean; isCalibrating: boolean }
+  options: { showWireframe: boolean; isCalibrating: boolean; poseLandmarks?: RawPoseLandmark[] | null }
 ) {
   ctx.clearRect(0, 0, width, height);
+
+  // Draw Upper Body Shoulder & Neck Spine Skeleton when Pose landmarks are detected
+  if (options.showWireframe && options.poseLandmarks && options.poseLandmarks.length > 12) {
+    const ls = options.poseLandmarks[11];
+    const rs = options.poseLandmarks[12];
+    const le = options.poseLandmarks[13];
+    const re = options.poseLandmarks[14];
+    const nosePose = options.poseLandmarks[0];
+
+    if (ls && rs && (ls.visibility ?? 1) > 0.35 && (rs.visibility ?? 1) > 0.35) {
+      const postureStatus = metrics.posture?.postureStatus || 'UPRIGHT';
+      const poseColor =
+        postureStatus === 'UPRIGHT'
+          ? 'rgba(16, 185, 129, 0.85)'
+          : postureStatus === 'SLIGHT_SLOUCH'
+          ? 'rgba(245, 158, 11, 0.85)'
+          : 'rgba(244, 63, 94, 0.85)';
+
+      ctx.strokeStyle = poseColor;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(ls.x * width, ls.y * height);
+      ctx.lineTo(rs.x * width, rs.y * height);
+      ctx.stroke();
+
+      // Neck / spine vector from shoulder midpoint to nose
+      const midX = ((ls.x + rs.x) / 2) * width;
+      const midY = ((ls.y + rs.y) / 2) * height;
+      if (nosePose) {
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(midX, midY);
+        ctx.lineTo(nosePose.x * width, nosePose.y * height);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Upper arms if visible
+      ctx.lineWidth = 2;
+      if (le && (le.visibility ?? 0) > 0.4) {
+        ctx.beginPath();
+        ctx.moveTo(ls.x * width, ls.y * height);
+        ctx.lineTo(le.x * width, le.y * height);
+        ctx.stroke();
+      }
+      if (re && (re.visibility ?? 0) > 0.4) {
+        ctx.beginPath();
+        ctx.moveTo(rs.x * width, rs.y * height);
+        ctx.lineTo(re.x * width, re.y * height);
+        ctx.stroke();
+      }
+
+      // Shoulder joint dots
+      ctx.fillStyle = poseColor;
+      [ls, rs].forEach((pt) => {
+        ctx.beginPath();
+        ctx.arc(pt.x * width, pt.y * height, 5, 0, 2 * Math.PI);
+        ctx.fill();
+      });
+    }
+  }
 
   if (!landmarks || landmarks.length === 0) {
     // Draw guide bounding box when searching for face
@@ -474,14 +706,19 @@ export function drawComputerVisionHUD(
   }
 
   // 4. Subtle Real-Time Telemetry HUD Corner Tag
+  const hasPosture = Boolean(metrics.posture && metrics.posture.postureStatus !== 'UNKNOWN');
   ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-  ctx.fillRect(8, 8, 210, 48);
+  ctx.fillRect(8, 8, 228, hasPosture ? 64 : 48);
   ctx.strokeStyle = metrics.isWithinBounds ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.4)';
-  ctx.strokeRect(8, 8, 210, 48);
+  ctx.strokeRect(8, 8, 228, hasPosture ? 64 : 48);
 
   ctx.font = '10px "JetBrains Mono", monospace';
   ctx.fillStyle = metrics.state === 'FOCUSED' ? '#34d399' : metrics.state === 'DISTRACTED' ? '#f87171' : '#fbbf24';
   ctx.textAlign = 'left';
   ctx.fillText(`POSE: Y:${metrics.yaw >= 0 ? '+' : ''}${metrics.yaw}° P:${metrics.pitch >= 0 ? '+' : ''}${metrics.pitch}°`, 14, 24);
   ctx.fillText(`GAZE: ${metrics.gazeX >= 0 ? '+' : ''}${metrics.gazeX}° | BOUND: ${metrics.isWithinBounds ? 'SAFE' : 'OUT'}`, 14, 40);
+  if (hasPosture && metrics.posture) {
+    ctx.fillStyle = metrics.posture.postureScore >= 82 ? '#34d399' : metrics.posture.postureScore >= 65 ? '#fbbf24' : '#f87171';
+    ctx.fillText(`BODY: ${metrics.posture.postureScore}% (${metrics.posture.postureStatus.replace('_', ' ')})`, 14, 56);
+  }
 }
